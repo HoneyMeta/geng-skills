@@ -1,0 +1,6 @@
+# geng-skills 可选增强依赖。
+# 注意：数据检查（data 子命令）零依赖即可运行——docx 用标准库 zipfile 解析。
+# 以下仅用于图片处理与 PDF 报告；缺失时会自动降级（跳过尺寸/拼版、PDF 降级为 HTML）。
+
+Pillow>=9.0      # 图片尺寸读取 + 缩略图拼版（contact sheet）
+reportlab>=3.6   # PDF 报告生成（缺失则输出 HTML）
