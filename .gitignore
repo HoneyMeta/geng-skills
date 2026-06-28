@@ -6,13 +6,12 @@ report.html
 extracted_images/
 out_*_imgs/
 
-# 临时/测试脚手架
-_dbg.py
-_mkfix.py
-test_*.tex
-test_*.docx
-fig1.png
-blot2.png
+# 临时/测试脚手架（仅忽略仓库根目录下的，testdoc/ 里的示例稿要保留）
+/_*.py
+/test_*.tex
+/test_*.docx
+/fig1.png
+/blot2.png
 
 # python
 __pycache__/

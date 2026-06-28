@@ -13,6 +13,13 @@
 > 设计哲学（与 [ai-check-skills](https://github.com/HoneyMeta/ai-check-skills) 一致）：
 > **确定性脚本只筛信号，AI 模型负责判读**，以避免误报。脚本不下"造假"结论。
 
+## 报告示例
+
+![geng-skills 检测报告示例](docs/assets/sample-report.png)
+
+> 自动导出 PDF：风险分级表（数据异常 + 模型判读）、图像取证表、整体结论与免责声明。
+> 上图为对一份含人造数据 + 修饰过的 t-SNE 图的测试稿生成的报告。
+
 ## 为什么是 skill 而不是普通脚本
 
 耿同学的工作流本质就是"**确定性统计/查重筛信号 + 人判断**"。这与 AI agent skill 的范式完全吻合：
@@ -20,27 +27,40 @@
 
 ## 安装
 
-```bash
-# 数据检查零依赖即可运行（Python 3.9+）。可选增强：
-pip install -r requirements.txt   # Pillow（图片）、reportlab（PDF）
-```
+本 skill 面向 AI 编程助手（Claude Code / OpenCode / Codex 等）。直接对你的 AI 说：
 
-## 用法
+> **安装 https://github.com/HoneyMeta/geng-skills 这个技能**
+
+AI 会把本仓库拉取到它的 skills 目录。可选增强依赖（图片处理 + PDF 报告）：
+
+```bash
+pip install -r requirements.txt   # Pillow（图片）、reportlab（PDF）；缺失会自动降级
+```
+> 数据检查零依赖即可运行（Python 3.9+，docx 用标准库解析）。
+
+## 使用
+
+安装后，把论文（`.docx` / `.tex` / LaTeX 工程目录）交给 AI，然后说：
+
+> **使用 geng-skills 这个技能** 检查我这篇论文有没有数据/图像造假风险
+
+AI 会按技能流程自动：抽数据跑取证统计 → 抽图片并用视觉判读 PS 痕迹 → 生成 PDF 报告。
+
+<details>
+<summary>手动运行底层脚本（一般无需，AI 会自动调用）</summary>
 
 ```bash
 # 1) 数据取证
 python scripts/geng_check.py data   --input paper.tex  --out findings.json
-python scripts/geng_check.py data   --input paper.docx --out findings.json
-
 # 2) 抽取图片（之后由 AI 看图判读）
 python scripts/geng_check.py images --input paper.docx --out-dir extracted_images --contact-sheet
-
-# 3) GRIM 均值自洽（按需）
+# 3) GRIM / SPRITE-lite（按需）
 python scripts/geng_check.py grim   --mean 3.45 --n 20 --decimals 2
-
+python scripts/geng_check.py sprite --mean 2.0 --sd 3.0 --n 20 --min 1 --max 7
 # 4) 生成报告（合并 AI 判读 verdicts.json）
 python scripts/geng_check.py report --findings findings.json --verdicts verdicts.json --out report.pdf
 ```
+</details>
 
 完整工作流、判读尺度与各检查项含义见 [SKILL.md](SKILL.md) 与 [references/](references/)。
 
