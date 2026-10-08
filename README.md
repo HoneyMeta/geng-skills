@@ -27,18 +27,14 @@
 
 ## 安装
 
-本 skill 面向 AI 编程助手（Claude Code / Codex / OpenCode / Cursor / GitHub Copilot 等）。
-推荐用通用的 skills 安装器：
-
-```bash
-npx skills add HoneyMeta/geng-skills
-```
-
-或者直接对你的 AI 说：
+本 skill 面向 AI 编程助手（Claude Code / Codex / OpenCode / Cursor / GitHub Copilot 等）。直接对你的 AI 说：
 
 > **安装 https://github.com/HoneyMeta/geng-skills 这个技能**
 
-AI 会把本仓库拉取到它的 skills 目录。可选增强依赖（图片处理 + PDF 报告 + PDF 矢量图预览）：
+AI 会把本仓库拉取到它的 skills 目录，装好后重启客户端即可生效。
+也可以手动用通用的 skills 安装器：`npx skills add HoneyMeta/geng-skills`。
+
+可选增强依赖（图片处理 + PDF 报告 + PDF 矢量图预览）：
 
 ```bash
 pip install -r requirements.txt   # Pillow（图片）、reportlab（PDF）、PyMuPDF（可选）；缺失会自动降级
