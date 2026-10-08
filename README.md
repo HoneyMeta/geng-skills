@@ -7,8 +7,8 @@
 
 支持 **LaTeX**（`.tex` / 工程目录）与 **Word**（`.docx`），从两个方向检查常见造假信号，最终导出 **PDF 报告**：
 
-- **数值数据异常**：末位数字分布、Benford 定律、完美等差数列、重复数据块、重复行、GRIM 均值自洽。
-- **图像 PS 痕迹**：抽取全部图片 + sha1 完全重复检测 + 缩略图拼版，由 **AI 模型用视觉能力**判读复制重用、拼接、克隆/涂抹等痕迹（不依赖任何 CV 库）。
+- **数值数据异常**：末位数字分布、Benford 定律、完美等差数列、重复数据块、重复行、GRIM 均值自洽、SPRITE-lite 标准差可能性。
+- **图像 PS 痕迹**：抽取全部图片 + sha1 完全重复检测 + **"一图多用"引用计数** + 缩略图拼版，由 **AI 模型用视觉能力**判读复制重用、拼接、克隆/涂抹等痕迹（不依赖任何 CV 库）。
 
 > 设计哲学（与 [ai-check-skills](https://github.com/HoneyMeta/ai-check-skills) 一致）：
 > **确定性脚本只筛信号，AI 模型负责判读**，以避免误报。脚本不下"造假"结论。
@@ -27,14 +27,21 @@
 
 ## 安装
 
-本 skill 面向 AI 编程助手（Claude Code / OpenCode / Codex 等）。直接对你的 AI 说：
+本 skill 面向 AI 编程助手（Claude Code / Codex / OpenCode / Cursor / GitHub Copilot 等）。
+推荐用通用的 skills 安装器：
+
+```bash
+npx skills add HoneyMeta/geng-skills
+```
+
+或者直接对你的 AI 说：
 
 > **安装 https://github.com/HoneyMeta/geng-skills 这个技能**
 
-AI 会把本仓库拉取到它的 skills 目录。可选增强依赖（图片处理 + PDF 报告）：
+AI 会把本仓库拉取到它的 skills 目录。可选增强依赖（图片处理 + PDF 报告 + PDF 矢量图预览）：
 
 ```bash
-pip install -r requirements.txt   # Pillow（图片）、reportlab（PDF）；缺失会自动降级
+pip install -r requirements.txt   # Pillow（图片）、reportlab（PDF）、PyMuPDF（可选）；缺失会自动降级
 ```
 > 数据检查零依赖即可运行（Python 3.9+，docx 用标准库解析）。
 
@@ -55,7 +62,7 @@ python scripts/geng_check.py data   --input paper.tex  --out findings.json
 # 2) 抽取图片（之后由 AI 看图判读）
 python scripts/geng_check.py images --input paper.docx --out-dir extracted_images --contact-sheet
 # 3) GRIM / SPRITE-lite（按需）
-python scripts/geng_check.py grim   --mean 3.45 --n 20 --decimals 2
+python scripts/geng_check.py grim   --mean 3.45 --n 20 --decimals 2          # 多题量表加 --items 5
 python scripts/geng_check.py sprite --mean 2.0 --sd 3.0 --n 20 --min 1 --max 7
 # 4) 生成报告（合并 AI 判读 verdicts.json）
 python scripts/geng_check.py report --findings findings.json --verdicts verdicts.json --out report.pdf
@@ -67,21 +74,23 @@ python scripts/geng_check.py report --findings findings.json --verdicts verdicts
 ## 输出
 
 - `findings.json` — 数据信号（type / severity / location / stat / explanation）。
-- `extracted_images/` + `manifest.json` — 全部图片、尺寸、sha1、完全重复分组、缩略图拼版。
+- `extracted_images/` + `manifest.json` — 全部图片、尺寸、sha1、引用次数、完全重复分组（`exactDuplicateFiles`）、
+  一图多用（`reusedImages`）、缩略图拼版；LaTeX 的 PDF 矢量图另有 `*.preview.png`。
 - `report.pdf`（或降级 `report.html`）— 风险分级表 + 图像判读 + 整体结论 + 免责声明。
 
 ## 检查项一览
 
 | 方向 | 检查 | 信号 |
 |---|---|---|
-| 数据 | 末位数字均匀性 | 卡方偏离（如 2400 个末位全 5） |
+| 数据 | 末位数字均匀性 | 卡方偏离（如 2400 个末位全 5）；小样本用精确二项检验 |
 | 数据 | Benford 首位数字 | 跨数量级数据的首位偏离 |
 | 数据 | 等差数列 | 测量列呈完美线性 |
-| 数据 | 重复数据块 / 行 | 跨样本复制粘贴 |
+| 数据 | 重复数据块 / 行 | 跨样本复制粘贴（"均值 ± SD"中的 SD 也参与比对） |
 | 数据 | 小数位异常不一致 | 同列精度混杂（弱信号） |
-| 数据 | GRIM | 报告均值数学上不可能 |
+| 数据 | GRIM | 报告均值数学上不可能（支持多题量表） |
 | 数据 | SPRITE-lite | 有界数据的报告标准差超理论上界 |
 | 图像 | 完全重复文件 | sha1 一致（脚本自动） |
+| 图像 | 一图多用 | 同一图片文件在文中插入多次（脚本自动，docx 靠引用计数） |
 | 图像 | 复制/拼接/克隆/涂抹 | AI 视觉判读 |
 
 ## 限制

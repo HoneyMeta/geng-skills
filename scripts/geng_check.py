@@ -14,7 +14,8 @@ geng_check.py — geng-skills 论文诚信自检工具（数据取证 + 图像�
 子命令：
   data    从 .docx / .tex / 目录抽取数值表并运行取证统计 -> findings.json
   images  从 .docx / .tex / 目录抽取所有图片 + 生成清单 manifest.json（可选缩略图拼版）
-  grim    GRIM 自洽检验：给定 均值/样本量/小数位，判断报告均值在数学上是否可能
+  grim    GRIM 自洽检验：给定 均值/样本量/小数位（可选题目数），判断报告均值在数学上是否可能
+  sprite  SPRITE-lite：给定 均值/标准差/样本量/取值上下界，判断报告标准差在数学上是否可能
   report  合并 findings.json + 模型给出的 verdicts.json -> report.pdf（缺 reportlab 则 report.html）
 
 用法示例：
@@ -22,6 +23,7 @@ geng_check.py — geng-skills 论文诚信自检工具（数据取证 + 图像�
   python geng_check.py data   --input paper.tex  --out findings.json
   python geng_check.py images --input paper.docx --out-dir extracted_images --contact-sheet
   python geng_check.py grim   --mean 3.45 --n 20 --decimals 2
+  python geng_check.py sprite --mean 2.0 --sd 3.0 --n 20 --min 1 --max 7
   python geng_check.py report --findings findings.json --verdicts verdicts.json --out report.pdf
 """
 
@@ -64,14 +66,48 @@ def parse_number(token):
     return val, cleaned
 
 
+def normalize_number_text(text):
+    """统一 Word/LaTeX 里常见的数字写法：Unicode 负号、全角数字/小数点。"""
+    return (text.replace("−", "-").replace("–", "-")
+            .translate(str.maketrans("０１２３４５６７８９．", "0123456789.")))
+
+
 def extract_numbers_from_text(text):
     """返回 [(float, cleaned_str)]。"""
     out = []
-    for m in NUM_RE.finditer(text):
+    for m in NUM_RE.finditer(normalize_number_text(text)):
         parsed = parse_number(m.group(0))
         if parsed is not None:
             out.append(parsed)
     return out
+
+
+# 表格单元格里的 "均值 ± 标准差" / "均值 (标准差)" 写法：拆成 (均值, 标准差) 两个数。
+_NUM = r"[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)?\.?\d+(?:[eE][-+]?\d+)?"
+MEAN_SD_RE = re.compile(r"^\s*(" + _NUM + r")\s*%?\s*(?:±|\+/-|\+-|\(|（)\s*(" + _NUM + r")\s*%?\s*[)）]?\s*%?\s*$")
+
+
+def parse_cell_numbers(cell):
+    """解析单元格：返回 (主值, 标准差或None)；不是单值/均值±SD 形式时返回 None。"""
+    text = normalize_number_text(cell)
+    m = MEAN_SD_RE.match(text)
+    if m:
+        mean, sd = parse_number(m.group(1)), parse_number(m.group(2))
+        if mean is not None and sd is not None:
+            return mean, sd
+    nums = extract_numbers_from_text(text)
+    if len(nums) == 1:
+        return nums[0], None
+    return None
+
+
+def significant_digit_count(cleaned):
+    s = re.split(r"[eE]", cleaned.lstrip("+-"))[0].replace(".", "").lstrip("0")
+    return len(s)
+
+
+def is_year_like(value, cleaned):
+    return "." not in cleaned and 1900 <= value <= 2100
 
 
 def last_significant_digit(cleaned):
@@ -183,32 +219,49 @@ def read_docx(path):
         xml = z.read("word/document.xml")
     root = ET.fromstring(xml)
 
-    def cell_text(tc):
+    def para_text(p):
+        # w:t 是文字；w:tab / w:br 当作空格，避免相邻数字被粘成一个（如 "12.3" + "4.5" -> "12.34.5"）
         parts = []
-        for t in tc.iter(W_NS + "t"):
-            parts.append(t.text or "")
+        for el in p.iter():
+            if el.tag == W_NS + "t":
+                parts.append(el.text or "")
+            elif el.tag in (W_NS + "tab", W_NS + "br", W_NS + "cr"):
+                parts.append(" ")
         return "".join(parts).strip()
 
-    def para_text(p):
-        parts = []
-        for t in p.iter(W_NS + "t"):
-            parts.append(t.text or "")
-        return "".join(parts).strip()
+    def cell_text(tc):
+        # 只取单元格自己的段落（嵌套表格单独作为一张表处理），段落之间用空格隔开
+        return " ".join(t for t in (para_text(p) for p in tc.findall(W_NS + "p")) if t)
+
+    def grid_span(tc):
+        span = tc.find(f"{W_NS}tcPr/{W_NS}gridSpan")
+        try:
+            return max(1, int(span.get(W_NS + "val"))) if span is not None else 1
+        except (TypeError, ValueError):
+            return 1
 
     tables = []
+    table_paragraphs = set()
     for tbl in root.iter(W_NS + "tbl"):
+        table_paragraphs.update(tbl.iter(W_NS + "p"))
         rows = []
-        for tr in tbl.iter(W_NS + "tr"):
-            cells = [cell_text(tc) for tc in tr.findall(W_NS + "tc")]
+        for tr in tbl.findall(W_NS + "tr"):
+            cells = []
+            for tc in tr.findall(W_NS + "tc"):
+                cells.append(cell_text(tc))
+                # 横向合并单元格占多列：补空位，保证后面的列不错位
+                cells.extend([""] * (grid_span(tc) - 1))
             rows.append(cells)
         if rows:
             tables.append(rows)
 
-    # 全文（含段落与表格文本）
+    # 正文（不含表格里的段落——表格数字已在 tables 中，避免全文统计重复计数）
     texts = []
     body = root.find(W_NS + "body")
     if body is not None:
         for p in body.iter(W_NS + "p"):
+            if p in table_paragraphs:
+                continue
             txt = para_text(p)
             if txt:
                 texts.append(txt)
@@ -216,12 +269,51 @@ def read_docx(path):
     return full_text, tables
 
 
-LATEX_TABULAR_RE = re.compile(r"\\begin\{(?:tabular|tabularx|longtable|array)\}.*?\\end\{(?:tabular|tabularx|longtable|array)\}", re.DOTALL)
+TABULAR_ENVS = r"(?:tabular\*?|tabularx|tabulary|longtable|array|tblr|longtblr|talltblr|NiceTabular\*?)"
+LATEX_TABULAR_RE = re.compile(r"\\begin\{(" + TABULAR_ENVS + r")\}.*?\\end\{\1\}", re.DOTALL)
+LATEX_DISPLAY_MATH_RE = re.compile(
+    r"\\begin\{(equation|align|gather|multline|eqnarray|displaymath)(\*?)\}.*?\\end\{\1\2\}"
+    r"|\\\[.*?\\\]|\$\$.*?\$\$", re.DOTALL)
+# 只用于排版/引用、参数里的数字不是数据的命令：整条连参数删掉
+LATEX_NOISE_CMD_RE = re.compile(
+    r"\\(?:label|ref|eqref|autoref|cref|Cref|pageref|cite[a-zA-Z]*|includegraphics|input|include|"
+    r"url|href|bibliography|bibliographystyle|graphicspath|usepackage|documentclass|setlength|"
+    r"addtolength|vspace|hspace|rule|resizebox|scalebox|setcounter|addlinespace|cmidrule|cline|"
+    r"arrayrulecolor|rowcolor|cellcolor|columncolor)\*?(?:\([^)]*\))?(?:\s*\[[^\]]*\])*(?:\s*\{[^{}]*\})*")
+
+
+def _skip_latex_args(s, i):
+    """从位置 i 起跳过连续的 [..] / {..} 参数（支持嵌套花括号），返回新位置。"""
+    while i < len(s):
+        j = i
+        while j < len(s) and s[j] in " \t\r\n":
+            j += 1
+        if j < len(s) and s[j] in "[{":
+            close = "]" if s[j] == "[" else "}"
+            depth, k = 0, j
+            while k < len(s):
+                if s[k] == s[j]:
+                    depth += 1
+                elif s[k] == close:
+                    depth -= 1
+                    if depth == 0:
+                        break
+                k += 1
+            i = k + 1
+        else:
+            return i
+    return i
 
 
 def _strip_latex(cell):
     s = cell
-    s = re.sub(r"\\(?:textbf|textit|mathbf|emph|num|SI|si)\s*\{([^{}]*)\}", r"\1", s)
+    # 合并单元格只保留内容，否则 \multicolumn{3}{c}{...} 里的 "3" 会被当成数据
+    s = re.sub(r"\\multicolumn\s*\{[^{}]*\}\s*\{[^{}]*\}\s*\{((?:[^{}]|\{[^{}]*\})*)\}", r"\1", s)
+    s = re.sub(r"\\multirow\s*(?:\[[^\]]*\])?\s*\{[^{}]*\}\s*(?:\[[^\]]*\])?\s*\{[^{}]*\}\s*\{((?:[^{}]|\{[^{}]*\})*)\}", r"\1", s)
+    s = re.sub(r"\\textcolor\s*\{[^{}]*\}\s*\{([^{}]*)\}", r"\1", s)
+    s = LATEX_NOISE_CMD_RE.sub(" ", s)
+    s = re.sub(r"\\pm\b|\\mp\b", "±", s)
+    s = re.sub(r"\\(?:textbf|textit|mathbf|mathrm|text|emph|num|SI|si|underline|makecell)\s*\{([^{}]*)\}", r"\1", s)
     s = re.sub(r"\$([^$]*)\$", r"\1", s)
     s = re.sub(r"\\[a-zA-Z]+\*?", " ", s)   # 其余命令
     s = s.replace("{", " ").replace("}", " ").replace("\\", " ")
@@ -229,44 +321,108 @@ def _strip_latex(cell):
     return s.strip()
 
 
-def read_latex(path):
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        content = f.read()
-    # 去注释（行内 % 之后，未转义）
-    content = re.sub(r"(?<!\\)%.*", "", content)
+def strip_latex_comments(content):
+    return re.sub(r"(?<!\\)%.*", "", content)
 
+
+INPUT_RE = re.compile(r"\\(?:input|include|subfile)\s*\{([^}]+)\}")
+
+
+def expand_latex_inputs(path, seen=None):
+    """读取 .tex 并递归展开 \\input / \\include / \\subfile，返回 (内容, 已读取文件集合)。"""
+    seen = set() if seen is None else seen
+    real = os.path.realpath(path)
+    if real in seen:
+        return "", seen
+    seen.add(real)
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        content = strip_latex_comments(f.read())
+    base = os.path.dirname(os.path.abspath(path))
+
+    def repl(m):
+        ref = m.group(1).strip()
+        for cand in (ref, ref + ".tex"):
+            p = os.path.join(base, cand)
+            if os.path.isfile(p):
+                sub, _ = expand_latex_inputs(p, seen)
+                return "\n" + sub + "\n"
+        return m.group(0)
+
+    return INPUT_RE.sub(repl, content), seen
+
+
+def parse_latex_tables(content):
     tables = []
     for m in LATEX_TABULAR_RE.finditer(content):
         block = m.group(0)
-        # 去掉 begin/end 行本身
-        inner = re.sub(r"\\begin\{[^}]*\}(?:\[[^\]]*\])?(?:\{[^}]*\})?", "", block, count=1)
-        inner = re.sub(r"\\end\{[^}]*\}", "", inner)
+        # 去掉 \begin{env}[pos]{width}{colspec} 本身（列格式可能含嵌套花括号，如 {p{3cm}c}）
+        head = re.match(r"\\begin\{[^}]*\}", block)
+        inner = block[_skip_latex_args(block, head.end()):]
+        inner = re.sub(r"\\end\{[^}]*\}\s*$", "", inner)
         rows = []
         for raw_row in re.split(r"\\\\", inner):
-            raw_row = re.sub(r"\\hline|\\toprule|\\midrule|\\bottomrule|\\cline\{[^}]*\}", "", raw_row)
+            raw_row = re.sub(r"^\s*\[[^\]]*\]", "", raw_row)   # \\[2pt] 的行距参数
+            raw_row = re.sub(r"\\hline|\\toprule|\\midrule|\\bottomrule|\\endhead|\\endfirsthead|\\endfoot|\\endlastfoot", "", raw_row)
+            raw_row = LATEX_NOISE_CMD_RE.sub(" ", raw_row)
             if not raw_row.strip():
                 continue
             cells = [_strip_latex(c) for c in raw_row.split("&")]
             rows.append(cells)
         if rows:
             tables.append(rows)
-    return content, tables
+    return tables
+
+
+def latex_body_text(content):
+    """正文文本：去掉导言区、表格、行间公式和排版命令参数，避免把 0.5\\textwidth、12pt 之类当数据。"""
+    m = re.search(r"\\begin\{document\}", content)
+    body = content[m.end():] if m else content
+    body = LATEX_TABULAR_RE.sub(" ", body)
+    body = LATEX_DISPLAY_MATH_RE.sub(" ", body)
+    body = LATEX_NOISE_CMD_RE.sub(" ", body)
+    body = re.sub(r"\\begin\{[^}]*\}(?:\s*\[[^\]]*\])?", " ", body)
+    return body
+
+
+def read_latex(path):
+    content, _ = expand_latex_inputs(path)
+    return latex_body_text(content), parse_latex_tables(content)
+
+
+def find_latex_roots(input_dir):
+    tex_files = []
+    for dirpath, _, files in os.walk(input_dir):
+        for fn in files:
+            if fn.lower().endswith(".tex"):
+                tex_files.append(os.path.join(dirpath, fn))
+    roots = []
+    for tf in sorted(tex_files):
+        with open(tf, "r", encoding="utf-8", errors="replace") as f:
+            if re.search(r"^[^%\n]*\\documentclass", f.read(), re.M):
+                roots.append(tf)
+    return sorted(tex_files), roots
 
 
 def load_source(input_path):
-    """支持 .docx / .tex / 目录（递归收集 .tex）。返回 (full_text, tables, source_label)。"""
+    """支持 .docx / .tex / 目录。返回 (full_text, tables, source_label)。
+
+    目录：找到含 \\documentclass 的主文件并展开其 \\input/\\include；没有主文件时读取全部 .tex。
+    """
     tables = []
     texts = []
     if os.path.isdir(input_path):
-        tex_files = []
-        for dirpath, _, files in os.walk(input_path):
-            for fn in files:
-                if fn.lower().endswith((".tex",)):
-                    tex_files.append(os.path.join(dirpath, fn))
-        for tf in sorted(tex_files):
-            txt, tbls = read_latex(tf)
-            texts.append(txt)
-            tables.extend(tbls)
+        tex_files, roots = find_latex_roots(input_path)
+        if len(roots) > 1:
+            print(f"[warn] 目录中有 {len(roots)} 个含 \\documentclass 的主文件："
+                  f"{', '.join(os.path.relpath(r, input_path) for r in roots)}。"
+                  "旧版/备份稿会造成'重复数据'误报，建议直接把主 .tex 传给 --input。", file=sys.stderr)
+        seen = set()
+        for tf in (roots or tex_files):
+            if os.path.realpath(tf) in seen:
+                continue
+            content, seen = expand_latex_inputs(tf, seen)
+            texts.append(latex_body_text(content))
+            tables.extend(parse_latex_tables(content))
         return "\n".join(texts), tables, f"latex-project:{os.path.basename(os.path.normpath(input_path))}"
 
     ext = os.path.splitext(input_path)[1].lower()
@@ -284,39 +440,81 @@ def load_source(input_path):
 # ---------------------------------------------------------------------------
 
 def table_numeric_series(table):
-    """从一张表抽出每列、每行的数值序列。返回 dict: {'columns': [...], 'rows': [...]}，
-    每个序列是 [(float, cleaned_str), ...]。"""
+    """从一张表抽出每列、每行的数值序列。返回 dict:
+    {'columns': [...], 'sdColumns': {列号: [...]}, 'rows': [...], 'rowKeys': [...]}，
+    每个序列是 [(float, cleaned_str), ...]。"均值 ± SD" 单元格的均值进 columns/rows，SD 进 sdColumns；
+    rowKeys 是整行全部数字（含 SD），用于重复行比对。"""
     # 规整列数
     ncols = max((len(r) for r in table), default=0)
     columns = [[] for _ in range(ncols)]
+    sd_columns = defaultdict(list)
     rows = []
+    row_keys = []
     for r in table:
         row_vals = []
+        row_key = []
         for ci in range(ncols):
             cell = r[ci] if ci < len(r) else ""
-            nums = extract_numbers_from_text(cell)
-            if len(nums) == 1:
-                columns[ci].append(nums[0])
-                row_vals.append(nums[0])
+            parsed = parse_cell_numbers(cell)
+            if parsed is None:
+                continue
+            main, sd = parsed
+            columns[ci].append(main)
+            row_vals.append(main)
+            row_key.append(main[1])
+            if sd is not None:
+                sd_columns[ci].append(sd)
+                row_key.append("±" + sd[1])
         rows.append(row_vals)
-    return {"columns": columns, "rows": rows}
+        row_keys.append(row_key)
+    return {"columns": columns, "sdColumns": dict(sd_columns), "rows": rows, "rowKeys": row_keys}
+
+
+def is_trivial_series(series):
+    """年份表头、从 0/1 开始步长为 1 的序号列这类天然线性/重复的序列，不参与等差/重复检查。"""
+    vals = [(v, c) for (v, c) in series]
+    if not vals:
+        return True
+    if all(is_year_like(v, c) for (v, c) in vals):
+        return True
+    if all("." not in c for (_v, c) in vals):
+        ints = [v for (v, _c) in vals]
+        if ints[0] in (0, 1) and all(b - a == 1 for a, b in zip(ints, ints[1:])):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
 # 取证检查
 # ---------------------------------------------------------------------------
 
-def check_terminal_digits(numbers, location, min_n=30):
-    """末位数字应近似均匀（耿同学经典：2400 个数据末尾全是 5）。"""
-    digits = [last_significant_digit(c) for (_v, c) in numbers]
+def binomial_upper_tail(k, n, p):
+    """P(X >= k), X ~ Binomial(n, p)。"""
+    return sum(math.comb(n, i) * p ** i * (1 - p) ** (n - i) for i in range(k, n + 1))
+
+
+def check_terminal_digits(numbers, location, min_n=30, min_n_exact=12):
+    """末位数字应近似均匀（耿同学经典：2400 个数据末尾全是 5）。
+
+    只统计至少 2 位有效数字、且不像年份的数：0.5、7 这类单个有效数字的末位本身就不均匀，
+    2023 这类年份会让末位 3/4 偏多，都会造成误报。"""
+    digits = [last_significant_digit(c) for (v, c) in numbers
+              if significant_digit_count(c) >= 2 and not is_year_like(v, c)]
     digits = [d for d in digits if d is not None]
-    if len(digits) < min_n:
+    if len(digits) < min_n_exact:
         return None
     counts = Counter(digits)
     observed = [counts.get(str(d), 0) for d in range(10)]
-    chi2, dof, p = chi_square_test(observed, [0.1] * 10)
     dist = {str(d): counts.get(str(d), 0) for d in range(10)}
     top_digit, top_count = max(dist.items(), key=lambda kv: kv[1])
+    if len(digits) >= min_n:
+        chi2, dof, p = chi_square_test(observed, [0.1] * 10)
+        method = "chi-square"
+    else:
+        # 样本太少，卡方近似不可靠：改用"最多的那个末位数字"的精确二项检验（×10 做 Bonferroni 校正）
+        chi2, dof = None, None
+        p = min(1.0, 10 * binomial_upper_tail(top_count, len(digits), 0.1))
+        method = "exact-binomial(dominant digit)"
     severity = "info"
     if p < 1e-6:
         severity = "high"
@@ -330,7 +528,8 @@ def check_terminal_digits(numbers, location, min_n=30):
         "type": "terminal_digit_uniformity",
         "severity": severity,
         "location": location,
-        "stat": {"n": len(digits), "chi2": round(chi2, 3), "dof": dof, "pValue": p,
+        "stat": {"n": len(digits), "method": method,
+                  "chi2": round(chi2, 3) if chi2 is not None else None, "dof": dof, "pValue": p,
                   "distribution": dist, "dominantDigit": top_digit,
                   "dominantShare": round(top_count / len(digits), 3)},
         "explanation": "末位有效数字偏离均匀分布。真实测量数据的末位数字通常接近均匀；"
@@ -400,57 +599,73 @@ def check_arithmetic_progression(series_vals, location, min_len=5, tol=1e-9):
     return None
 
 
-def check_duplicate_blocks(all_series, min_block=4):
-    """在所有数值序列里寻找重复的数据块（>=min_block 个数完全相同的子序列）。"""
+def check_duplicate_blocks(all_series, min_block=4, covered=None):
+    """在所有数值序列里寻找重复的数据块（>=min_block 个数完全相同的子序列）。
+
+    重叠的滑动窗口会合并成"最长重复段"，一段重复数据只报一条；
+    covered 里的 (位置, 长度) 表示已被 duplicate_row 报过的整行，不再重复报。"""
     findings = []
-    # 规范化为 cleaned 字符串元组
-    seqs = []
+    covered = covered or set()
+    seqs = {}
     for loc, series in all_series:
         cleaned = [c for (_v, c) in series]
         if len(cleaned) >= min_block:
-            seqs.append((loc, cleaned))
+            seqs[loc] = cleaned
     seen = defaultdict(list)
-    for loc, cleaned in seqs:
-        n = len(cleaned)
-        for i in range(0, n - min_block + 1):
+    for loc, cleaned in seqs.items():
+        for i in range(0, len(cleaned) - min_block + 1):
             block = tuple(cleaned[i:i + min_block])
             # 跳过全相同块（重复值另有检查）
             if len(set(block)) == 1:
                 continue
             seen[block].append((loc, i))
-    reported = set()
-    for block, occ in seen.items():
-        if len(occ) >= 2 and block not in reported:
-            reported.add(block)
-            findings.append({
-                "type": "duplicate_data_block",
-                "severity": "high",
-                "location": "; ".join(sorted({o[0] for o in occ})),
-                "stat": {"block": list(block), "occurrences": len(occ),
-                          "where": [f"{o[0]}@idx{o[1]}" for o in occ[:6]]},
-                "explanation": "同一段数值块在多处重复出现。跨样本/跨实验条件出现相同数据块，"
-                               "是数据复制粘贴的强信号，'不小心'难以解释。",
-            })
+
+    # 出现位置集合 -> 窗口；把 (loc,i)->(loc,i+1) 连续的窗口串成一段
+    windows = {tuple(sorted(occ)): block for block, occ in seen.items() if len(occ) >= 2}
+    for occ, block in windows.items():
+        prev = tuple(sorted((loc, i - 1) for loc, i in occ))
+        if prev in windows:
+            continue  # 不是一段重复的起点
+        run = list(block)
+        cur = occ
+        while True:
+            nxt = tuple(sorted((loc, i + 1) for loc, i in cur))
+            if nxt not in windows:
+                break
+            run.append(windows[nxt][-1])
+            cur = nxt
+        if all((loc, len(run)) in covered and i == 0 for loc, i in occ):
+            continue
+        findings.append({
+            "type": "duplicate_data_block",
+            "severity": "high",
+            "location": "; ".join(sorted({loc for loc, _i in occ})),
+            "stat": {"block": run, "length": len(run), "occurrences": len(occ),
+                      "where": [f"{loc}@idx{i}" for loc, i in occ[:6]]},
+            "explanation": "同一段数值块在多处重复出现。跨样本/跨实验条件出现相同数据块，"
+                           "是数据复制粘贴的强信号，'不小心'难以解释。",
+        })
     return findings
 
 
 def check_duplicate_rows(tables_series, source_label):
-    """跨表/表内完全相同的行。"""
+    """跨表/表内完全相同的行。≥3 个数值全同 -> high；恰好 2 个数值全同（如消融表两行一模一样）-> medium。"""
     findings = []
     rowmap = defaultdict(list)
     for ti, ts in enumerate(tables_series):
-        for ri, row in enumerate(ts["rows"]):
-            if len(row) >= 3:
-                key = tuple(c for (_v, c) in row)
-                rowmap[key].append(f"{source_label}#表{ti + 1}行{ri + 1}")
-    for key, locs in rowmap.items():
-        if len(locs) >= 2:
+        for ri, (row, key) in enumerate(zip(ts["rows"], ts["rowKeys"])):
+            if len(row) >= 2 and len(set(key)) > 1 and not is_trivial_series(row):
+                rowmap[tuple(key)].append((f"{source_label}#表{ti + 1}行{ri + 1}", len(row)))
+    for key, occ in rowmap.items():
+        if len(occ) >= 2:
+            n_values = occ[0][1]
             findings.append({
                 "type": "duplicate_row",
-                "severity": "high",
-                "location": "; ".join(locs[:8]),
-                "stat": {"row": list(key), "occurrences": len(locs)},
-                "explanation": "完全相同的数据行重复出现（≥3 个数值且全部一致）。需确认是否同一行被复制。",
+                "severity": "high" if n_values >= 3 else "medium",
+                "location": "; ".join(loc for loc, _n in occ[:8]),
+                "stat": {"row": list(key), "occurrences": len(occ)},
+                "explanation": f"完全相同的数据行重复出现（{n_values} 个数值全部一致）。"
+                               "不同条件/样本/配置的结果逐位相同，需确认是否同一行被复制。",
             })
     return findings
 
@@ -489,19 +704,25 @@ def run_data_forensics(full_text, tables, source_label):
     findings = []
     tables_series = [table_numeric_series(t) for t in tables]
 
-    # 收集"命名"序列：表的每列/每行
+    # 收集"命名"序列：表的每列/每行（SD 列单独成序列）
     all_series = []
     for ti, ts in enumerate(tables_series):
         for ci, col in enumerate(ts["columns"]):
             if len(col) >= 3:
                 all_series.append((f"{source_label}#表{ti + 1}列{ci + 1}", col))
+        for ci, col in sorted(ts["sdColumns"].items()):
+            if len(col) >= 3:
+                all_series.append((f"{source_label}#表{ti + 1}列{ci + 1}(SD)", col))
         for ri, row in enumerate(ts["rows"]):
             if len(row) >= 3:
                 all_series.append((f"{source_label}#表{ti + 1}行{ri + 1}", row))
+    all_series = [(loc, s) for loc, s in all_series if not is_trivial_series(s)]
 
-    # 全文数字（用于全局末位/Benford）
-    text_numbers = extract_numbers_from_text(full_text)
+    # 正文数字（用于全局末位/Benford）：正文已不含表格，去掉 [12] / [3-5] 这类引用编号
+    text_numbers = extract_numbers_from_text(
+        re.sub(r"\[\d+(?:\s*[-–,，、]\s*\d+)*\]", " ", full_text))
     table_numbers = [pair for ts in tables_series for col in ts["columns"] for pair in col]
+    table_numbers += [pair for ts in tables_series for col in ts["sdColumns"].values() for pair in col]
     all_numbers = text_numbers + table_numbers
 
     # 全局末位数字 + Benford
@@ -532,9 +753,14 @@ def run_data_forensics(full_text, tables, source_label):
             if f:
                 findings.append(f)
 
-    # 重复数据块 / 重复行
-    findings.extend(check_duplicate_blocks(all_series))
-    findings.extend(check_duplicate_rows(tables_series, source_label))
+    # 重复行 / 重复数据块（已作为整行报过的不再按数据块重复报）
+    dup_rows = check_duplicate_rows(tables_series, source_label)
+    covered = set()
+    for fd in dup_rows:
+        for loc in fd["location"].split("; "):
+            covered.add((loc, len([k for k in fd["stat"]["row"] if not k.startswith("±")])))
+    findings.extend(dup_rows)
+    findings.extend(check_duplicate_blocks(all_series, covered=covered))
 
     # 为每个 finding 附 id
     for i, fd in enumerate(findings, 1):
@@ -565,9 +791,40 @@ def sha1_of(data):
     return hashlib.sha1(data).hexdigest()
 
 
+R_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+PKG_REL_NS = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+
+
+def docx_media_references(z):
+    """统计 document.xml 里每个 media 文件被引用（插入）了几次。
+
+    Word 会把内容完全相同的图片只存一份 media 文件、多处共用同一个关系 ID，
+    所以"同一张图在文中用了两次"在 media 目录里看不出来，只能靠引用计数发现。"""
+    import xml.etree.ElementTree as ET
+    names = set(z.namelist())
+    if "word/_rels/document.xml.rels" not in names:
+        return {}
+    rels = ET.fromstring(z.read("word/_rels/document.xml.rels"))
+    rid_to_media = {}
+    for rel in rels.iter(PKG_REL_NS + "Relationship"):
+        target = rel.get("Target", "")
+        if rel.get("TargetMode") == "External" or "media/" not in target:
+            continue
+        rid_to_media[rel.get("Id")] = "word/" + target.lstrip("/").replace("word/", "", 1)
+    counts = Counter()
+    root = ET.fromstring(z.read("word/document.xml"))
+    for el in root.iter():
+        for attr in (R_NS + "embed", R_NS + "id", R_NS + "link"):
+            rid = el.get(attr)
+            if rid in rid_to_media and (el.tag.endswith("}blip") or el.tag.endswith("}imagedata")):
+                counts[rid_to_media[rid]] += 1
+    return counts
+
+
 def extract_images_docx(path, out_dir):
     items = []
     with zipfile.ZipFile(path) as z:
+        refs = docx_media_references(z)
         media = [n for n in z.namelist() if n.startswith("word/media/")]
         for n in sorted(media):
             data = z.read(n)
@@ -575,34 +832,37 @@ def extract_images_docx(path, out_dir):
             out_path = os.path.join(out_dir, base)
             with open(out_path, "wb") as f:
                 f.write(data)
-            items.append({"file": base, "origin": n, "bytes": len(data), "sha1": sha1_of(data)})
+            items.append({"file": base, "origin": n, "bytes": len(data), "sha1": sha1_of(data),
+                          "references": refs.get(n, 0)})
     return items
 
 
-INCLUDEGRAPHICS_RE = re.compile(r"\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}")
-CAPTION_RE = re.compile(r"\\caption\{")
+INCLUDEGRAPHICS_RE = re.compile(r"\\includegraphics\*?(?:\s*\[[^\]]*\])?\s*\{([^}]+)\}")
+GRAPHICSPATH_RE = re.compile(r"\\graphicspath\s*\{((?:\s*\{[^}]*\}\s*)+)\}")
 
 
 def extract_images_latex(input_path, out_dir):
-    items = []
     if os.path.isdir(input_path):
-        roots = []
-        for dirpath, _, files in os.walk(input_path):
-            for fn in files:
-                if fn.lower().endswith(".tex"):
-                    roots.append(os.path.join(dirpath, fn))
+        tex_files, roots = find_latex_roots(input_path)
+        entries = roots or tex_files
         base_dirs = [input_path]
     else:
-        roots = [input_path]
+        entries = [input_path]
         base_dirs = [os.path.dirname(os.path.abspath(input_path))]
 
-    exts = ["", ".pdf", ".png", ".jpg", ".jpeg", ".eps", ".tif", ".tiff", ".gif", ".bmp"]
-    seen = set()
-    for tex in roots:
-        with open(tex, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
-        content_nc = re.sub(r"(?<!\\)%.*", "", content)
+    exts = ["", ".pdf", ".png", ".jpg", ".jpeg", ".eps", ".tif", ".tiff", ".gif", ".bmp", ".svg"]
+    by_path = {}     # 同一个源文件被多次 \includegraphics 时只抽一次，记录引用次数
+    items = []
+    used_names = set()
+    seen_tex = set()
+    for tex in entries:
+        if os.path.realpath(tex) in seen_tex:
+            continue
+        content_nc, seen_tex = expand_latex_inputs(tex, seen_tex)
         tex_dir = os.path.dirname(os.path.abspath(tex))
+        graphics_dirs = []
+        for gm in GRAPHICSPATH_RE.finditer(content_nc):
+            graphics_dirs += [os.path.join(tex_dir, d.strip()) for d in re.findall(r"\{([^}]*)\}", gm.group(1))]
         for m in INCLUDEGRAPHICS_RE.finditer(content_nc):
             ref = m.group(1).strip()
             # 找到附近的 caption 作为上下文
@@ -611,33 +871,62 @@ def extract_images_latex(input_path, out_dir):
             cm = re.search(r"\\caption\{(.+?)\}", tail, re.DOTALL)
             if cm:
                 ctx = _strip_latex(cm.group(1))[:160]
-            # 解析实际文件路径
+            # 解析实际文件路径（含 \graphicspath）
             resolved = None
-            search_dirs = [tex_dir] + base_dirs
-            for d in search_dirs:
+            for d in [tex_dir] + graphics_dirs + base_dirs:
                 for ext in exts:
                     cand = os.path.join(d, ref + ext)
                     if os.path.isfile(cand):
-                        resolved = cand
+                        resolved = os.path.realpath(cand)
                         break
                 if resolved:
                     break
             if resolved is None:
                 items.append({"file": None, "origin": ref, "resolved": False,
-                               "refContext": ctx, "bytes": 0, "sha1": None})
+                               "refContext": ctx, "bytes": 0, "sha1": None, "references": 1})
+                continue
+            if resolved in by_path:
+                it = by_path[resolved]
+                it["references"] += 1
+                if ctx:
+                    it.setdefault("otherContexts", []).append(ctx)
                 continue
             with open(resolved, "rb") as f:
                 data = f.read()
             base = os.path.basename(resolved)
-            if base in seen:
-                base = f"{len(seen)}_" + base
-            seen.add(base)
-            out_path = os.path.join(out_dir, base)
-            with open(out_path, "wb") as f:
+            if base in used_names:
+                base = f"{len(used_names)}_" + base
+            used_names.add(base)
+            with open(os.path.join(out_dir, base), "wb") as f:
                 f.write(data)
-            items.append({"file": base, "origin": ref, "resolved": True,
-                           "refContext": ctx, "bytes": len(data), "sha1": sha1_of(data)})
+            it = {"file": base, "origin": ref, "resolved": True,
+                  "refContext": ctx, "bytes": len(data), "sha1": sha1_of(data), "references": 1}
+            by_path[resolved] = it
+            items.append(it)
     return items
+
+
+def render_vector_previews(items, out_dir, dpi=150):
+    """PDF 矢量图无法直接看图：装了 PyMuPDF 时把第一页渲染成 PNG 预览，供拼版和模型看图。"""
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        return 0
+    n = 0
+    for it in items:
+        name = it.get("file")
+        if not name or not name.lower().endswith(".pdf"):
+            continue
+        try:
+            with fitz.open(os.path.join(out_dir, name)) as doc:
+                pix = doc[0].get_pixmap(dpi=dpi)
+                preview = os.path.splitext(name)[0] + ".preview.png"
+                pix.save(os.path.join(out_dir, preview))
+                it["preview"] = preview
+                n += 1
+        except Exception:
+            continue
+    return n
 
 
 def enrich_dimensions(items, out_dir):
@@ -666,9 +955,10 @@ def build_contact_sheet(items, out_dir, cols=4, thumb=320):
     for it in items:
         if not it.get("file"):
             continue
-        p = os.path.join(out_dir, it["file"])
+        p = os.path.join(out_dir, it.get("preview") or it["file"])
         try:
-            im = Image.open(p).convert("RGB")
+            with Image.open(p) as src:
+                im = src.convert("RGB")
             im.thumbnail((thumb, thumb))
             imgs.append((it["file"], im))
         except Exception:
@@ -704,13 +994,18 @@ def run_image_extraction(input_path, out_dir, contact_sheet=False):
         source_label = (os.path.basename(os.path.normpath(input_path))
                         if os.path.isdir(input_path) else os.path.basename(input_path))
     enrich_dimensions(items, out_dir)
+    previews = render_vector_previews(items, out_dir)
 
-    # 自动检测：完全相同的图片文件（sha1 一致）
+    # 自动检测 1：完全相同的图片文件（sha1 一致）
     byhash = defaultdict(list)
     for it in items:
         if it.get("sha1"):
             byhash[it["sha1"]].append(it["file"])
     exact_dups = [{"sha1": h, "files": fs} for h, fs in byhash.items() if len(fs) > 1]
+    # 自动检测 2：同一个图片文件在文中被插入多次（Word 会把相同图片合并成一个文件，只能靠引用计数发现）
+    reused = [{"file": it["file"], "references": it["references"],
+               "contexts": [c for c in [it.get("refContext")] + it.get("otherContexts", []) if c]}
+              for it in items if it.get("file") and it.get("references", 0) > 1]
 
     sheet = build_contact_sheet(items, out_dir) if contact_sheet else None
 
@@ -723,6 +1018,8 @@ def run_image_extraction(input_path, out_dir, contact_sheet=False):
         "imageCount": sum(1 for it in items if it.get("file")),
         "unresolvedCount": sum(1 for it in items if not it.get("file")),
         "exactDuplicateFiles": exact_dups,
+        "reusedImages": reused,
+        "vectorPreviews": previews,
         "contactSheet": sheet,
         "images": items,
     }
@@ -733,25 +1030,32 @@ def run_image_extraction(input_path, out_dir, contact_sheet=False):
 # GRIM
 # ---------------------------------------------------------------------------
 
-def grim_check(mean, n, decimals):
-    """GRIM：报告均值 mean（小数位 decimals）在样本量 n 下是否在数学上可能。"""
-    granularity = 10 ** (-decimals)
-    nearest_sum = round(mean * n)
-    consistent = False
-    matched_sum = None
-    for s in (nearest_sum - 1, nearest_sum, nearest_sum + 1):
-        recomputed = round(s / n, decimals)
-        if abs(recomputed - round(mean, decimals)) < granularity / 2:
-            consistent = True
-            matched_sum = s
-            break
+def grim_check(mean, n, decimals, items=1):
+    """GRIM：报告均值 mean（小数位 decimals）在样本量 n 下是否在数学上可能。
+
+    整数数据（或 items 道整数题的均分）的总和必须是整数，所以真实均值只能是 k/(n*items)。
+    判定标准：存在某个 k 使 k/(n*items) 落在报告值的舍入区间 [mean-半个末位, mean+半个末位] 内。
+    用区间判断而不是 Python 的 round()，因为 round() 是"银行家舍入"，
+    会把 2.125 舍成 2.12，从而把四舍五入报告的 2.13 误判为不一致。"""
+    denom = n * items
+    half = 0.5 * 10 ** (-decimals)
+    eps = 1e-9
+    lo = math.ceil((mean - half - eps) * denom)
+    hi = math.floor((mean + half + eps) * denom)
+    consistent = lo <= hi
+    informative = denom < 10 ** decimals
+    if consistent:
+        note = "均值在数学上可由整数总和得到，GRIM 通过。"
+        if not informative:
+            note += f"（注意：n×题数={denom} ≥ 10^{decimals}，任何均值都能通过，GRIM 在此不具判别力。）"
+    else:
+        note = "报告均值无法由任何整数总和在该小数位下还原，GRIM 不一致——可能是笔误或编造。"
     return {
-        "mean": mean, "n": n, "decimals": decimals,
+        "mean": mean, "n": n, "items": items, "decimals": decimals,
         "consistent": consistent,
-        "impliedSum": matched_sum if consistent else nearest_sum,
-        "note": ("均值在数学上可由整数总和得到，GRIM 通过。"
-                 if consistent else
-                 "报告均值无法由任何整数总和在该小数位下还原，GRIM 不一致——可能是笔误或编造。"),
+        "informative": informative,
+        "impliedSum": lo if consistent else round(mean * denom),
+        "note": note,
     }
 
 
@@ -813,10 +1117,10 @@ def generate_html_report(data, verdicts, out_html, template_path=None):
         verdict = v.get("verdict", "—")
         comment = v.get("comment", "")
         rows.append(
-            f"<tr class='sev-{fd.get('severity')}'>"
-            f"<td>{fd.get('id','')}</td>"
+            f"<tr class='sev-{_html_escape(fd.get('severity',''))}'>"
+            f"<td>{_html_escape(fd.get('id',''))}</td>"
             f"<td>{SEV_LABEL.get(fd.get('severity'),'')}</td>"
-            f"<td>{fd.get('type','')}</td>"
+            f"<td>{_html_escape(fd.get('type',''))}</td>"
             f"<td>{_html_escape(fd.get('location',''))}</td>"
             f"<td>{_html_escape(fd.get('explanation',''))}<br><small>{_html_escape(json.dumps(fd.get('stat',{}), ensure_ascii=False))}</small></td>"
             f"<td><b>{_html_escape(str(verdict))}</b><br>{_html_escape(comment)}</td>"
@@ -825,7 +1129,7 @@ def generate_html_report(data, verdicts, out_html, template_path=None):
     image_rows = []
     for iv in verdicts.get("imageVerdicts", []):
         image_rows.append(
-            f"<tr class='sev-{iv.get('severity','info')}'>"
+            f"<tr class='sev-{_html_escape(iv.get('severity','info'))}'>"
             f"<td>{_html_escape(iv.get('file',''))}</td>"
             f"<td>{SEV_LABEL.get(iv.get('severity','info'),'')}</td>"
             f"<td>{_html_escape(iv.get('issue',''))}</td>"
@@ -885,6 +1189,43 @@ def _html_escape(s):
     return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
+# 中文 TrueType 字体候选（reportlab 不支持 CFF/OTF 轮廓的字体，如 Noto Sans CJK .otf、苹方）
+CJK_FONT_CANDIDATES = [
+    ("C:/Windows/Fonts/msyh.ttc", "MSYH"),
+    ("C:/Windows/Fonts/simhei.ttf", "SimHei"),
+    ("C:/Windows/Fonts/simsun.ttc", "SimSun"),
+    ("/System/Library/Fonts/STHeiti Medium.ttc", "STHeiti"),
+    ("/System/Library/Fonts/STHeiti Light.ttc", "STHeiti"),
+    ("/Library/Fonts/Arial Unicode.ttf", "ArialUnicode"),
+    ("/System/Library/Fonts/Supplemental/Arial Unicode.ttf", "ArialUnicode"),
+    ("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", "WQYMicroHei"),
+    ("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc", "WQYZenHei"),
+    ("/usr/share/fonts/wqy-microhei/wqy-microhei.ttc", "WQYMicroHei"),
+    ("/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf", "DroidSansFallback"),
+]
+
+
+def register_cjk_font(pdfmetrics, TTFont):
+    """依次尝试 环境变量 GENG_PDF_FONT -> 系统中文 TTF -> reportlab 内置 STSong-Light（任何系统都可用）。"""
+    candidates = list(CJK_FONT_CANDIDATES)
+    env_font = os.environ.get("GENG_PDF_FONT")
+    if env_font:
+        candidates.insert(0, (env_font, "GengCustom"))
+    for fp, fn in candidates:
+        if os.path.isfile(fp):
+            try:
+                pdfmetrics.registerFont(TTFont(fn, fp))
+                return fn
+            except Exception:
+                continue
+    try:
+        from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+        pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+        return "STSong-Light"
+    except Exception:
+        return "Helvetica"
+
+
 def generate_pdf_report(data, verdicts, out_pdf):
     try:
         from reportlab.lib.pagesizes import A4
@@ -898,18 +1239,7 @@ def generate_pdf_report(data, verdicts, out_pdf):
     except ImportError:
         return None
 
-    # 中文字体：尝试常见 Windows 字体
-    font_name = "Helvetica"
-    for fp, fn in [("C:/Windows/Fonts/msyh.ttc", "MSYH"),
-                   ("C:/Windows/Fonts/simhei.ttf", "SimHei"),
-                   ("C:/Windows/Fonts/simsun.ttc", "SimSun")]:
-        if os.path.isfile(fp):
-            try:
-                pdfmetrics.registerFont(TTFont(fn, fp))
-                font_name = fn
-                break
-            except Exception:
-                continue
+    font_name = register_cjk_font(pdfmetrics, TTFont)
 
     styles = getSampleStyleSheet()
     base = ParagraphStyle("base", parent=styles["Normal"], fontName=font_name, fontSize=8, leading=11)
@@ -922,7 +1252,7 @@ def generate_pdf_report(data, verdicts, out_pdf):
     story.append(Paragraph("geng-skills · 论文诚信自检报告", title))
     story.append(Spacer(1, 6))
     sev_counts = data.get("severityCounts", {})
-    meta = (f"文档：{data.get('source','—')}　生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}<br/>"
+    meta = (f"文档：{_html_escape(data.get('source','—'))}　生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}<br/>"
             f"检测类型：数据完整性 + 图像取证（投稿前自检）<br/>"
             f"风险统计：高 {sev_counts.get('high',0)}　中 {sev_counts.get('medium',0)}　"
             f"低 {sev_counts.get('low',0)}　图像问题 {len(verdicts.get('imageVerdicts',[]))}")
@@ -1020,12 +1350,16 @@ def cmd_images(args):
         print(f"         有 {manifest['unresolvedCount']} 个 \\includegraphics 未能定位源文件。")
     if manifest["exactDuplicateFiles"]:
         print(f"         发现 {len(manifest['exactDuplicateFiles'])} 组完全相同的图片文件（sha1 一致）。")
+    if manifest["reusedImages"]:
+        print(f"         发现 {len(manifest['reusedImages'])} 张图片在文中被插入多次（见 manifest.json 的 reusedImages）。")
+    if manifest["vectorPreviews"]:
+        print(f"         已把 {manifest['vectorPreviews']} 个 PDF 矢量图渲染为 *.preview.png 供看图。")
     if manifest.get("contactSheet"):
         print(f"         缩略图拼版：{manifest['contactSheet']}")
 
 
 def cmd_grim(args):
-    res = grim_check(args.mean, args.n, args.decimals)
+    res = grim_check(args.mean, args.n, args.decimals, items=args.items)
     print(json.dumps(res, ensure_ascii=False, indent=2))
 
 
@@ -1070,6 +1404,7 @@ def main():
     p.add_argument("--mean", type=float, required=True)
     p.add_argument("--n", type=int, required=True)
     p.add_argument("--decimals", type=int, required=True)
+    p.add_argument("--items", type=int, default=1, help="多题量表的题目数（均分=总分/(n×题数)），默认 1")
     p.set_defaults(func=cmd_grim)
 
     p = sub.add_parser("sprite", help="SPRITE-lite 标准差可能性检验（需取值上下界）")

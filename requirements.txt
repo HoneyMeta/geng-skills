@@ -3,4 +3,5 @@
 # 以下仅用于图片处理与 PDF 报告；缺失时会自动降级（跳过尺寸/拼版、PDF 降级为 HTML）。
 
 Pillow>=9.0      # 图片尺寸读取 + 缩略图拼版（contact sheet）
-reportlab>=3.6   # PDF 报告生成（缺失则输出 HTML）
+reportlab>=3.6   # PDF 报告生成（缺失则输出 HTML）；无中文 TTF 时自动使用内置 STSong-Light
+PyMuPDF>=1.23    # 可选：把 LaTeX 的 PDF 矢量图渲染成 PNG 预览，供拼版和模型看图
