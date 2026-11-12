@@ -13,6 +13,8 @@ geng_check.py — geng-skills 论文诚信自检工具（数据取证 + 图像�
 
 子命令：
   data    从 .docx / .tex / 目录抽取数值表并运行取证统计 -> findings.json
+          （同时重算正文报告的 t/F/r/χ2/z 检验 p 值、检查 p 值在 0.05 下方堆积、扭曲短语、
+          参考文献编号/重复；加 --verify-refs 时联网到 Crossref 核对 DOI、撤稿声明）
   images  从 .docx / .tex / 目录抽取所有图片 + 生成清单 manifest.json（可选缩略图拼版）
   grim    GRIM 自洽检验：给定 均值/样本量/小数位（可选题目数），判断报告均值在数学上是否可能
   sprite  SPRITE-lite：给定 均值/标准差/样本量/取值上下界，判断报告标准差在数学上是否可能
@@ -46,6 +48,13 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 SCHEMA_VERSION = 1
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+import refs_check  # noqa: E402
+import stats_check  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # 数字解析
@@ -783,6 +792,82 @@ def run_data_forensics(full_text, tables, source_label):
     }
 
 
+THEBIBLIOGRAPHY_RE = re.compile(r"\\begin\{thebibliography\}.*?\\end\{thebibliography\}", re.S)
+
+
+def load_reference_info(input_path):
+    """参考文献 + 正文（不含参考文献）。返回 dict(kind, bodyText, entries, citedKeys)。"""
+    if os.path.isdir(input_path):
+        tex_files, roots = find_latex_roots(input_path)
+        cited, entries, seen = [], [], set()
+        for tf in (roots or tex_files):
+            content, seen = expand_latex_inputs(tf, seen)
+            c, e = refs_check.parse_latex_references(content, os.path.dirname(os.path.abspath(tf)))
+            cited.extend(c)
+            entries.extend(e)
+        return {"kind": "latex", "entries": entries, "citedKeys": cited}
+    ext = os.path.splitext(input_path)[1].lower()
+    if ext == ".tex":
+        content, _ = expand_latex_inputs(input_path)
+        cited, entries = refs_check.parse_latex_references(content, os.path.dirname(os.path.abspath(input_path)))
+        return {"kind": "latex", "entries": entries, "citedKeys": cited}
+    if ext == ".docx":
+        full_text, _ = read_docx(input_path)
+    else:
+        with open(input_path, "r", encoding="utf-8", errors="replace") as f:
+            full_text = f.read()
+    body, raw_entries = refs_check.split_plain_references(full_text)
+    entries = []
+    for text in raw_entries:
+        doi = refs_check.DOI_RE.search(text)
+        entries.append({"text": text, "doi": doi.group(1).rstrip(".") if doi else "", "title": ""})
+    return {"kind": "plain", "bodyText": body, "entries": entries, "citedKeys": []}
+
+
+def run_text_checks(full_text, refinfo, source_label, verify_refs=False, mailto=None, fetch=None):
+    """正文统计量重算、p 值堆积、扭曲短语、参考文献检查（可选联网核对）。"""
+    findings = []
+    findings += stats_check.check_reported_tests(full_text, source_label, chi_square_pvalue)
+    caliper = stats_check.check_p_caliper(full_text, source_label)
+    if caliper:
+        findings.append(caliper)
+    findings += refs_check.check_tortured_phrases(full_text, source_label)
+    entries = refinfo.get("entries") or []
+    if refinfo.get("kind") == "latex":
+        findings += refs_check.check_latex_citations(refinfo.get("citedKeys") or [], entries, source_label)
+    else:
+        findings += refs_check.check_numeric_citations(refinfo.get("bodyText", ""), [e["text"] for e in entries], source_label)
+    findings += refs_check.check_duplicate_entries([e["text"] for e in entries], source_label)
+    if verify_refs and entries:
+        kwargs = {"mailto": mailto}
+        if fetch is not None:
+            kwargs.update(fetch=fetch, pause=0)
+        findings += refs_check.verify_references(entries, source_label, **kwargs)
+    return findings
+
+
+def analyze(input_path, verify_refs=False, mailto=None, fetch=None):
+    """data 子命令的完整流程：数值取证 + 正文统计量 + 参考文献。"""
+    full_text, tables, label = load_source(input_path)
+    refinfo = load_reference_info(input_path)
+    # 参考文献里的年份、卷期、页码不是数据，不参与末位/Benford 统计
+    if refinfo["kind"] == "plain" and refinfo.get("entries"):
+        number_text = refinfo["bodyText"]
+    else:
+        number_text = THEBIBLIOGRAPHY_RE.sub(" ", full_text)
+    result = run_data_forensics(number_text, tables, label)
+    extra = run_text_checks(full_text, refinfo, label, verify_refs=verify_refs, mailto=mailto, fetch=fetch)
+    findings = result["findings"] + extra
+    for i, fd in enumerate(findings, 1):
+        fd["id"] = f"data-{i:04d}"
+    result["findings"] = findings
+    result["severityCounts"] = dict(Counter(fd["severity"] for fd in findings))
+    result["stats"]["reportedTests"] = len(stats_check.extract_reported_tests(full_text))
+    result["stats"]["referenceCount"] = len(refinfo.get("entries") or [])
+    result["stats"]["referencesVerifiedOnline"] = bool(verify_refs)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # 图片抽取
 # ---------------------------------------------------------------------------
@@ -1009,6 +1094,19 @@ def run_image_extraction(input_path, out_dir, contact_sheet=False):
 
     sheet = build_contact_sheet(items, out_dir) if contact_sheet else None
 
+    # 自动检测 3：感知哈希近重复（缩放/重存/裁成子图/旋转/镜像后再用），需 Pillow
+    near_dups = []
+    try:
+        import image_similarity
+        paths = []
+        for it in items:
+            name = it.get("preview") or it.get("file")
+            if name and os.path.splitext(name)[1].lower() in (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp"):
+                paths.append(os.path.join(out_dir, name))
+        near_dups = image_similarity.find_near_duplicates(paths, out_dir=out_dir)
+    except ImportError:
+        print("[images] 未安装 Pillow，跳过感知哈希近重复检测。", file=sys.stderr)
+
     manifest = {
         "schemaVersion": SCHEMA_VERSION,
         "kind": "images",
@@ -1019,6 +1117,7 @@ def run_image_extraction(input_path, out_dir, contact_sheet=False):
         "unresolvedCount": sum(1 for it in items if not it.get("file")),
         "exactDuplicateFiles": exact_dups,
         "reusedImages": reused,
+        "nearDuplicates": near_dups,
         "vectorPreviews": previews,
         "contactSheet": sheet,
         "images": items,
@@ -1160,7 +1259,7 @@ small{{color:#666}}
 <div class="meta">
 <b>文档：</b>{_html_escape(str(data.get('source','—')))}
 <b>生成时间：</b>{datetime.now().strftime('%Y-%m-%d %H:%M')}
-<b>检测类型：</b>数据完整性 + 图像取证（投稿前自检）
+<b>检测类型：</b>数据完整性 + 统计量与参考文献 + 图像取证（投稿前自检）
 </div>
 <div class="cards">
 <div class="card"><div class="n">{sev_counts.get('high',0)}</div>高风险</div>
@@ -1253,7 +1352,7 @@ def generate_pdf_report(data, verdicts, out_pdf):
     story.append(Spacer(1, 6))
     sev_counts = data.get("severityCounts", {})
     meta = (f"文档：{_html_escape(data.get('source','—'))}　生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}<br/>"
-            f"检测类型：数据完整性 + 图像取证（投稿前自检）<br/>"
+            f"检测类型：数据完整性 + 统计量与参考文献 + 图像取证（投稿前自检）<br/>"
             f"风险统计：高 {sev_counts.get('high',0)}　中 {sev_counts.get('medium',0)}　"
             f"低 {sev_counts.get('low',0)}　图像问题 {len(verdicts.get('imageVerdicts',[]))}")
     story.append(Paragraph(meta, base))
@@ -1329,8 +1428,9 @@ def generate_pdf_report(data, verdicts, out_pdf):
 # ---------------------------------------------------------------------------
 
 def cmd_data(args):
-    full_text, tables, label = load_source(args.input)
-    result = run_data_forensics(full_text, tables, label)
+    if args.verify_refs:
+        print("[data] --verify-refs：将把参考文献的 DOI / 条目文本发送到 Crossref 公共 API 核对。", file=sys.stderr)
+    result = analyze(args.input, verify_refs=args.verify_refs, mailto=args.mailto)
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
     print(f"[data] 已分析 {result['stats']['tableCount']} 张表 / "
@@ -1338,6 +1438,8 @@ def cmd_data(args):
           f"检出 {len(result['findings'])} 条信号 -> {args.out}")
     sc = result["severityCounts"]
     print(f"       风险：高 {sc.get('high',0)} / 中 {sc.get('medium',0)} / 低 {sc.get('low',0)}")
+    print(f"       正文统计检验 {result['stats']['reportedTests']} 处已重算 p 值；参考文献 {result['stats']['referenceCount']} 条"
+          + ("（已联网核对）" if result['stats']['referencesVerifiedOnline'] else "（未联网核对，可加 --verify-refs）"))
 
 
 def cmd_images(args):
@@ -1352,6 +1454,9 @@ def cmd_images(args):
         print(f"         发现 {len(manifest['exactDuplicateFiles'])} 组完全相同的图片文件（sha1 一致）。")
     if manifest["reusedImages"]:
         print(f"         发现 {len(manifest['reusedImages'])} 张图片在文中被插入多次（见 manifest.json 的 reusedImages）。")
+    if manifest.get("nearDuplicates"):
+        print(f"         感知哈希发现 {len(manifest['nearDuplicates'])} 对近重复区域（可能经缩放/裁剪/旋转/镜像），"
+              "对照图见 _near_dup_*.png，需看图确认。")
     if manifest["vectorPreviews"]:
         print(f"         已把 {manifest['vectorPreviews']} 个 PDF 矢量图渲染为 *.preview.png 供看图。")
     if manifest.get("contactSheet"):
@@ -1392,6 +1497,9 @@ def main():
     p = sub.add_parser("data", help="抽取数值并运行取证统计")
     p.add_argument("--input", required=True, help=".docx / .tex / latex 目录")
     p.add_argument("--out", default="findings.json")
+    p.add_argument("--verify-refs", action="store_true",
+                   help="联网到 Crossref 核对参考文献 DOI 是否存在、标题是否相符、是否被撤稿（需用户同意）")
+    p.add_argument("--mailto", help="可选：Crossref polite pool 的联系邮箱（由用户提供）")
     p.set_defaults(func=cmd_data)
 
     p = sub.add_parser("images", help="抽取图片 + 生成清单")

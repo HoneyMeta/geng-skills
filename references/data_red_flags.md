@@ -152,6 +152,63 @@ python scripts/geng_check.py sprite --mean 2.0 --sd 3.0 --n 20 --min 1 --max 7
 
 ---
 
+## 9. `reported_p_inconsistent` — 报告的 p 值与统计量对不上（statcheck 式重算）
+
+**原理**：`t(28) = 2.20` 对应的双尾 p 是 .036。若文中写 `p = .015` 或 `p < .01`，统计量、自由度、p 值三者至少有一个写错。
+Nuijten 等人用 statcheck 统计心理学文献，约一半论文至少有一处这类不一致，约八分之一有"决策性不一致"。
+
+**识别格式**：`t(df) = x, p …`、`F(df1, df2) = x, p …`、`r(df) = x, p …`、`χ2(df[, N = n]) = x, p …`、`z = x, p …`；
+p 的比较符可为 `= < > ≤ ≥`；兼容 LaTeX（`$t(28)=2.20$`、`\chi^2`、`\leq`）和中文全角（`t（28）＝2.20，P＜0.05`）。
+统计量和 p 之间允许夹一两个效应量（如 `d = 0.5,`）。
+
+**判定**：统计量按其小数位上下各放宽半个单位重算 p 区间；`p = x` 允许 x 本身的四舍五入；`p = .000` 视为 p < .0005。
+
+**严重度**：显著性结论（α=.05）反转 → high；其余不符 → medium；按单尾检验能对上 → low（提醒在文中说明单尾）。
+
+**正当原因（需排除）**：单尾检验未注明、Welch 校正后的非整数自由度被四舍五入、多重比较校正后的 p、
+报告的是精确检验/置换检验的 p。多数不一致只是笔误，请对照统计软件原始输出改正。
+
+---
+
+## 10. `p_value_bunching` — p 值在 0.05 下方堆积
+
+**原理**：真实效应下 p 值分布向小值偏，0.04–0.05 区间的数量通常不多于 0.03–0.04。
+在 0.05 下方明显堆积可能提示选择性报告或反复调整分析直到显著（p-hacking）。
+
+**统计**：只统计精确报告的 p（`p = .043`）；两区间合计 ≥ 8 个时做单侧二项检验，p < .05 才报。
+
+**严重度**：low（整篇层面的弱信号，只用于提醒核对是否报告了全部分析）。
+
+---
+
+## 11. `tortured_phrases` — 扭曲短语
+
+**原理**：改写/洗稿工具把专业术语换成字面同义词，产生 profound learning（deep learning）、irregular woodland
+（random forest）、bosom malignant growth（breast cancer）这类短语。Cabanac 等人的 Problematic Paper Screener 用它
+筛查论文工厂稿件。内置清单只收高精度短语，命中时给出应有的规范术语。
+
+**严重度**：≥2 种短语 → medium；1 种 → low。
+
+---
+
+## 12. 参考文献检查
+
+| type | 含义 | 严重度 |
+|---|---|---|
+| `citation_without_reference` | 正文 `[n]` 超出参考文献列表，或 `\cite` 的 key 未定义 | medium |
+| `reference_never_cited` | 列表里的条目从未在正文被引用（只在顺序编码/thebibliography 时检查） | low |
+| `duplicate_reference` | 同一文献列了两次（同 DOI 或条目文字几乎相同） | low |
+| `reference_doi_not_found` | （联网）DOI 在 Crossref 不存在：DOI 抄错，或虚构/AI 幻觉生成的引用 | medium |
+| `reference_doi_mismatch` | （联网）DOI 对应论文的标题与条目不符 | medium |
+| `cited_retracted_work` | （联网）被引论文有撤稿/撤回（high）或关注声明（medium） | high / medium |
+| `reference_not_found` | （联网）无 DOI 的英文条目在 Crossref 找不到相符标题 | low |
+
+联网检查只在 `--verify-refs` 时执行，会把 DOI 和条目文本发给 Crossref 公共 API，务必先征得用户同意。
+DataCite 等其他注册机构的 DOI、多数中文期刊、书籍、学位论文、网页在 Crossref 查不到，属于正常；
+查不到只说明"需人工核实"，不等于文献不存在。
+
+---
+
 ## 表格解析说明（影响能检出什么）
 
 - Word：按单元格段落取文字，横向合并单元格（gridSpan）会补位，后面的列不会错位。
