@@ -53,6 +53,8 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
+import consistency_check  # noqa: E402
+import rawdata_check  # noqa: E402
 import refs_check  # noqa: E402
 import stats_check  # noqa: E402
 
@@ -846,8 +848,18 @@ def run_text_checks(full_text, refinfo, source_label, verify_refs=False, mailto=
     return findings
 
 
-def analyze(input_path, verify_refs=False, mailto=None, fetch=None):
-    """data 子命令的完整流程：数值取证 + 正文统计量 + 参考文献。"""
+def run_consistency_checks(full_text, number_text, tables, source_label):
+    """正文报告的均值/SD/n 的 GRIM/GRIMMER（仅整数数据语境）+ 正文与表格数字是否一致。"""
+    findings = consistency_check.check_reported_means(full_text, source_label)
+    findings += consistency_check.check_text_vs_tables(number_text, tables, source_label, parse_cell_numbers, extract_numbers_from_text)
+    return findings
+
+
+RAW_DATA_HELPERS = {"terminal": check_terminal_digits, "benford": check_benford, "blocks": check_duplicate_blocks}
+
+
+def analyze(input_path, verify_refs=False, mailto=None, fetch=None, data_files=None):
+    """data 子命令的完整流程：数值取证 + 正文统计量 + 一致性 + 参考文献（+ 可选原始数据文件）。"""
     full_text, tables, label = load_source(input_path)
     refinfo = load_reference_info(input_path)
     # 参考文献里的年份、卷期、页码不是数据，不参与末位/Benford 统计
@@ -857,6 +869,12 @@ def analyze(input_path, verify_refs=False, mailto=None, fetch=None):
         number_text = THEBIBLIOGRAPHY_RE.sub(" ", full_text)
     result = run_data_forensics(number_text, tables, label)
     extra = run_text_checks(full_text, refinfo, label, verify_refs=verify_refs, mailto=mailto, fetch=fetch)
+    extra += run_consistency_checks(full_text, number_text, tables, label)
+    raw_info = []
+    for path in data_files or []:
+        raw_findings, info = rawdata_check.run_raw_data_checks(path, RAW_DATA_HELPERS)
+        extra += raw_findings
+        raw_info.append(info)
     findings = result["findings"] + extra
     for i, fd in enumerate(findings, 1):
         fd["id"] = f"data-{i:04d}"
@@ -865,6 +883,9 @@ def analyze(input_path, verify_refs=False, mailto=None, fetch=None):
     result["stats"]["reportedTests"] = len(stats_check.extract_reported_tests(full_text))
     result["stats"]["referenceCount"] = len(refinfo.get("entries") or [])
     result["stats"]["referencesVerifiedOnline"] = bool(verify_refs)
+    result["stats"]["reportedMeans"] = len(consistency_check.extract_reported_means(full_text))
+    if raw_info:
+        result["stats"]["rawDataFiles"] = raw_info
     return result
 
 
@@ -1430,7 +1451,10 @@ def generate_pdf_report(data, verdicts, out_pdf):
 def cmd_data(args):
     if args.verify_refs:
         print("[data] --verify-refs：将把参考文献的 DOI / 条目文本发送到 Crossref 公共 API 核对。", file=sys.stderr)
-    result = analyze(args.input, verify_refs=args.verify_refs, mailto=args.mailto)
+    for path in args.data_file or []:
+        if not os.path.isfile(path):
+            raise SystemExit(f"找不到原始数据文件: {path}")
+    result = analyze(args.input, verify_refs=args.verify_refs, mailto=args.mailto, data_files=args.data_file)
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
     print(f"[data] 已分析 {result['stats']['tableCount']} 张表 / "
@@ -1440,6 +1464,9 @@ def cmd_data(args):
     print(f"       风险：高 {sc.get('high',0)} / 中 {sc.get('medium',0)} / 低 {sc.get('low',0)}")
     print(f"       正文统计检验 {result['stats']['reportedTests']} 处已重算 p 值；参考文献 {result['stats']['referenceCount']} 条"
           + ("（已联网核对）" if result['stats']['referencesVerifiedOnline'] else "（未联网核对，可加 --verify-refs）"))
+    for info in result["stats"].get("rawDataFiles", []):
+        sheets = "、".join(f"{s['sheet']}（{s['rows']} 行 / {s['numericColumns']} 个数值列）" for s in info["sheets"])
+        print(f"       原始数据 {info['file']}：{sheets}")
 
 
 def cmd_images(args):
@@ -1465,6 +1492,12 @@ def cmd_images(args):
 
 def cmd_grim(args):
     res = grim_check(args.mean, args.n, args.decimals, items=args.items)
+    print(json.dumps(res, ensure_ascii=False, indent=2))
+
+
+def cmd_grimmer(args):
+    res = consistency_check.grimmer_check(args.mean, args.sd, args.n, args.decimals, args.sd_decimals,
+                                          items=args.items, sample=not args.population)
     print(json.dumps(res, ensure_ascii=False, indent=2))
 
 
@@ -1500,6 +1533,8 @@ def main():
     p.add_argument("--verify-refs", action="store_true",
                    help="联网到 Crossref 核对参考文献 DOI 是否存在、标题是否相符、是否被撤稿（需用户同意）")
     p.add_argument("--mailto", help="可选：Crossref polite pool 的联系邮箱（由用户提供）")
+    p.add_argument("--data-file", action="append", metavar="FILE",
+                   help="论文背后的原始数据（.csv / .tsv / .xlsx），可重复；做末位数字、Benford、重复行/列/数据块检查")
     p.set_defaults(func=cmd_data)
 
     p = sub.add_parser("images", help="抽取图片 + 生成清单")
@@ -1514,6 +1549,16 @@ def main():
     p.add_argument("--decimals", type=int, required=True)
     p.add_argument("--items", type=int, default=1, help="多题量表的题目数（均分=总分/(n×题数)），默认 1")
     p.set_defaults(func=cmd_grim)
+
+    p = sub.add_parser("grimmer", help="GRIMMER：整数数据的均值+标准差能否同时成立")
+    p.add_argument("--mean", type=float, required=True)
+    p.add_argument("--sd", type=float, required=True)
+    p.add_argument("--n", type=int, required=True)
+    p.add_argument("--decimals", type=int, required=True, help="均值的小数位数")
+    p.add_argument("--sd-decimals", type=int, help="标准差的小数位数（默认同均值）")
+    p.add_argument("--items", type=int, default=1, help="多题量表的题目数（报告的是题均分时），默认 1")
+    p.add_argument("--population", action="store_true", help="把 SD 当作总体标准差(除以 n)；默认按样本标准差(除以 n-1)")
+    p.set_defaults(func=cmd_grimmer)
 
     p = sub.add_parser("sprite", help="SPRITE-lite 标准差可能性检验（需取值上下界）")
     p.add_argument("--mean", type=float, required=True)

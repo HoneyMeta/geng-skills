@@ -5,9 +5,13 @@
 > 灵感来自["耿同学"的学术打假](https://zhuanlan.zhihu.com/p/2040725903106385012)。
 > "耿"既是致敬，也取**耿直**之意。本工具面向作者本人自查，**不教任何人掩盖造假**。
 
-支持 **LaTeX**（`.tex` / 工程目录）与 **Word**（`.docx`），从四个方向检查常见问题信号，最终导出 **PDF 报告**：
+支持 **LaTeX**（`.tex` / 工程目录）与 **Word**（`.docx`），从以下几个方向检查常见问题信号，最终导出 **PDF 报告**：
 
 - **数值数据异常**：末位数字分布、Benford 定律、完美等差数列、重复数据块、重复行、GRIM 均值自洽、SPRITE-lite 标准差可能性。
+- **数字前后一致**（v1.3 新增）：正文里 `M = 3.47, SD = 1.20, n = 20` 这类报告，如果上下文说明是量表/评分/计数这类整数数据，
+  自动做 **GRIM + GRIMMER**（均值和标准差能否由整数数据得到）；正文引用表格的数字与表格**相邻两位对调**（95.3 写成 93.5）会被指出。
+- **原始数据文件**（v1.3 新增）：把论文背后的 `.xlsx` / `.csv` 用 `--data-file` 一起交给它，逐列查末位数字、Benford、
+  重复行、完全相同的两列、重复数据片段；编号列、量表答案这类天然会重复的数据有专门的防误报规则。
 - **报告的统计量**（v1.2 新增）：正文里 `t(28) = 2.20, p = .036` 这类结果按统计量和自由度**重算 p 值**（类似 statcheck），
   对不上就报，显著性结论反转的标为高风险；还会提示 p 值在 0.05 下方异常堆积（p-hacking 弱信号）。支持中文全角写法和 LaTeX 写法。
 - **文本与参考文献**（v1.2 新增）：洗稿工具留下的"扭曲短语"（如 profound learning = deep learning）、正文引用编号超出参考文献列表、
@@ -56,6 +60,10 @@ pip install -r requirements.txt   # Pillow（图片）、reportlab（PDF）、Py
 
 AI 会按技能流程自动：抽数据跑取证统计、重算正文 p 值、检查参考文献 → 抽图片、跑近重复检测并用视觉判读 PS 痕迹 → 生成 PDF 报告。
 
+有原始数据（Excel / CSV）的话，一起给它：
+
+> **使用 geng-skills 检查这篇论文，原始数据在 data/raw.xlsx**
+
 想顺便核对参考文献是否真实存在、有没有引用已撤稿论文，可以说：
 
 > **使用 geng-skills 检查这篇论文，并联网核对参考文献**
@@ -70,8 +78,11 @@ AI 会按技能流程自动：抽数据跑取证统计、重算正文 p 值、�
 python scripts/geng_check.py data   --input paper.tex  --out findings.json [--verify-refs]
 # 2) 抽取图片（之后由 AI 看图判读）
 python scripts/geng_check.py images --input paper.docx --out-dir extracted_images --contact-sheet
-# 3) GRIM / SPRITE-lite（按需）
+# 1b) 同时检查原始数据（可重复）
+python scripts/geng_check.py data   --input paper.docx --out findings.json --data-file raw.xlsx
+# 3) GRIM / GRIMMER / SPRITE-lite（按需）
 python scripts/geng_check.py grim   --mean 3.45 --n 20 --decimals 2          # 多题量表加 --items 5
+python scripts/geng_check.py grimmer --mean 3.00 --sd 0.85 --n 5 --decimals 2
 python scripts/geng_check.py sprite --mean 2.0 --sd 3.0 --n 20 --min 1 --max 7
 # 4) 生成报告（合并 AI 判读 verdicts.json）
 python scripts/geng_check.py report --findings findings.json --verdicts verdicts.json --out report.pdf
@@ -82,7 +93,7 @@ python scripts/geng_check.py report --findings findings.json --verdicts verdicts
 
 ## 输出
 
-- `findings.json` — 数据、统计量、文本与参考文献信号（type / severity / location / stat / explanation）。
+- `findings.json` — 数据、统计量、数字一致性、文本与参考文献、原始数据文件的信号（type / severity / location / stat / explanation）。
 - `extracted_images/` + `manifest.json` — 全部图片、尺寸、sha1、引用次数、完全重复分组（`exactDuplicateFiles`）、
   一图多用（`reusedImages`）、近重复子图（`nearDuplicates`，附 `_near_dup_*.png` 对照图）、缩略图拼版；
   LaTeX 的 PDF 矢量图另有 `*.preview.png`。
@@ -99,6 +110,9 @@ python scripts/geng_check.py report --findings findings.json --verdicts verdicts
 | 数据 | 小数位异常不一致 | 同列精度混杂（弱信号） |
 | 数据 | GRIM | 报告均值数学上不可能（支持多题量表） |
 | 数据 | SPRITE-lite | 有界数据的报告标准差超理论上界 |
+| 一致性 | 正文 GRIM / GRIMMER | 整数数据（量表/计数）报告的均值、标准差与 n 数学上不可能（所有读法都试过才报） |
+| 一致性 | 正文与表格 | 提到表格的句子里的数字在表里找不到，表里却有相邻两位对调的数 |
+| 原始数据 | xlsx / csv | 末位数字（只查取值范围够宽的列）、Benford、含小数的重复行、完全相同的两列、连续数据里的重复片段 |
 | 统计量 | p 值重算 | t / F / r / χ2 / z 的报告 p 值与统计量、自由度不符；显著性反转为高风险 |
 | 统计量 | p 值堆积 | 精确 p 值在 0.04–0.05 明显多于 0.03–0.04（弱信号） |
 | 文本 | 扭曲短语 | 洗稿工具把术语换成字面同义词（profound learning、irregular woodland…） |
@@ -114,6 +128,7 @@ python scripts/geng_check.py report --findings findings.json --verdicts verdicts
 - 图像仅做**篇内**比对，不做跨论文/全库比对（需 ImageTwin、Proofig 等外部数据库）；近重复检测只看照片类子图，
   子图内部的局部克隆仍靠看图。
 - 依赖能从表格 / `tabular` 解析出数值；图片里的数据无法读取。
+- 正文 GRIM/GRIMMER 只检查同一句写明 n、且上下文说明是整数数据的报告；正文与表格只比对相邻数字对调这类笔误。
 - p 值重算只覆盖正文写全统计量和自由度的检验；只写 `p < 0.05` 的结果无法检查。
 - 联网核对只覆盖 Crossref 收录的文献；多数中文期刊、书籍、学位论文、网页查不到属正常，查不到≠不存在。
 - 所有结论需人工/模型确认；本工具只提供线索与报告，**不构成造假认定**，也不对应任何官方检测系统。
@@ -140,6 +155,15 @@ What it checks:
   `\cite` keys. With `--verify-refs` (only after the user agrees) DOIs are checked on the Crossref API: DOI not
   found, DOI that belongs to a different title, cited work with a retraction or expression-of-concern notice.
   This helps catch fabricated (hallucinated) references.
+- **Consistency between numbers** (new in v1.3): `M = 3.47, SD = 1.20, n = 20` in the text gets **GRIM and
+  GRIMMER** tests when the nearby text says the variable is integer-valued (Likert/rating scale, counts). It is only
+  flagged if it is impossible under every reading (item mean or total, sample or population SD). A number in a
+  sentence that cites a table, found in no table while a table holds the same digits with two neighbours swapped
+  (95.3 vs 93.5), is flagged as a likely typo. `geng_check.py grimmer` runs GRIMMER by hand.
+- **Raw data files** (new in v1.3): pass the `.xlsx` / `.csv` behind the paper with `--data-file`. Columns get
+  terminal-digit tests (only when their range is wide enough), the sheet gets Benford, and identical rows with
+  decimals, identical columns and repeated runs in continuous columns are reported. ID columns are skipped, and
+  rows of Likert answers that happen to match are not flagged.
 - **Images**: every figure is extracted; byte-identical files, the same image inserted twice, and (new in v1.2)
   perceptual-hash near-duplicates: figures are split into panels and photo-like panels are compared under
   8 rotations/mirrorings, so resized, re-saved, cropped, rotated or mirrored reuse is found. Side-by-side preview
@@ -150,7 +174,7 @@ Install by telling your AI assistant:
 > **Install the skill at https://github.com/HoneyMeta/geng-skills**
 
 Then: **"Use geng-skills to check my paper for data and image integrity problems"** (add "and verify the
-references online" to allow Crossref lookups). Optional dependencies: `pip install -r requirements.txt`.
+references online" to allow Crossref lookups, or "the raw data is in data/raw.xlsx" to check the data file too). Optional dependencies: `pip install -r requirements.txt`.
 
 Limits: image comparison is within the paper only (no cross-paper database such as ImageTwin or Proofig);
 p-value recomputation needs the full statistic and degrees of freedom in the text; online verification only
