@@ -1,0 +1,104 @@
+% geng-skills test document for the baseline (comparison-method) check.
+% A made-up paper whose comparison tables cite real papers. Planted problems:
+%   - DenseNet-BC (k=40) is reported as 4.83 / 20.85 instead of 3.46 / 17.18 (Huang et al., Table 2);
+%   - the CIFAR-10 improvement claim "by 1.5 points" matches no pair of table rows;
+%   - WRN-28-10 has a different CIFAR-10 error in Table 1 and Table 2;
+%   - the bold GFLOPs value of GengNet in Table 2 is not the lowest;
+%   - HyperRes-50 cites a paper that does not exist;
+%   - the CIFAR-100 test-set size per class is wrong (100, not 1,000);
+%   - the code link points to a repository that does not exist.
+% All other baseline numbers are copied from the cited arXiv papers.
+\documentclass{article}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\title{GengNet: Gated Residual Networks for Small-Image Classification}
+\author{Test Document}
+\date{November 2026}
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We propose GengNet, a gated residual network for small-image classification.
+On CIFAR-10, GengNet reduces the test error of the strongest baseline by 1.5 points,
+which is a 19.8\% relative error reduction over WRN-28-10.
+Code is available at \url{https://github.com/HoneyMeta/gengnet-cifar-does-not-exist}.
+\end{abstract}
+
+\section{Experiments}
+CIFAR-10 and CIFAR-100~\cite{krizhevsky2009learning} each contain 60,000 colour images of
+32$\times$32 pixels, split into 50,000 training images and 10,000 test images.
+CIFAR-10 has 10 classes; CIFAR-100 has 100 classes with 1,000 test images per class.
+We use standard data augmentation (translation and mirroring) for all models.
+
+Table~\ref{tab:sota} compares GengNet with residual and densely connected networks.
+On CIFAR-100, GengNet improves over WRN-28-10 by 2.23 points.
+
+\begin{table}[t]
+\centering
+\caption{Test error (\%) on CIFAR-10 and CIFAR-100 with standard data augmentation (lower is better).
+Results of the compared methods are taken from the original papers.}
+\label{tab:sota}
+\begin{tabular}{lccc}
+\toprule
+Method & Params & CIFAR-10 $\downarrow$ & CIFAR-100 $\downarrow$ \\
+\midrule
+ResNet-110~\cite{he2016deep} & 1.7M & 6.43 & -- \\
+Pre-act ResNet-1001~\cite{he2016identity} & 10.2M & 4.62 & 22.71 \\
+Stochastic Depth (110 layers)~\cite{huang2016deep} & 1.7M & 5.25 & 24.98 \\
+WRN-28-10~\cite{zagoruyko2016wide} & 36.5M & 4.00 & 19.25 \\
+DenseNet-BC ($k=40$)~\cite{huang2017densely} & 25.6M & 4.83 & 20.85 \\
+HyperRes-50~\cite{moreau2019hyper} & 23.4M & 4.37 & 20.12 \\
+\midrule
+GengNet (ours) & 12.3M & \textbf{3.21} & \textbf{17.02} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:cost} compares the computational cost.
+
+\begin{table}[t]
+\centering
+\caption{Parameters, computation and CIFAR-10 test error (\%).}
+\label{tab:cost}
+\begin{tabular}{lccc}
+\toprule
+Method & Params & GFLOPs & CIFAR-10 $\downarrow$ \\
+\midrule
+ResNet-110~\cite{he2016deep} & 1.7M & 0.25 & 6.43 \\
+WRN-28-10~\cite{zagoruyko2016wide} & 36.5M & 5.25 & 4.17 \\
+GengNet (ours) & 12.3M & \textbf{1.90} & \textbf{3.21} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
+\caption{Ablation on CIFAR-10 (test error, \%).}
+\label{tab:ablation}
+\begin{tabular}{lc}
+\toprule
+Variant & CIFAR-10 \\
+\midrule
+w/o gating & 3.88 \\
+w/o cosine schedule & 3.47 \\
+GengNet (full) & 3.21 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{thebibliography}{9}
+\bibitem{krizhevsky2009learning} A. Krizhevsky. Learning multiple layers of features from tiny images.
+Technical report, University of Toronto, 2009.
+\bibitem{he2016deep} K. He, X. Zhang, S. Ren, and J. Sun. Deep residual learning for image recognition.
+In CVPR, 2016. arXiv:1512.03385.
+\bibitem{he2016identity} K. He, X. Zhang, S. Ren, and J. Sun. Identity mappings in deep residual networks.
+In ECCV, 2016. doi:10.1007/978-3-319-46493-0\_38.
+\bibitem{huang2016deep} G. Huang, Y. Sun, Z. Liu, D. Sedra, and K. Q. Weinberger. Deep networks with stochastic depth.
+In ECCV, 2016.
+\bibitem{zagoruyko2016wide} S. Zagoruyko and N. Komodakis. Wide residual networks. In BMVC, 2016. arXiv:1605.07146.
+\bibitem{huang2017densely} G. Huang, Z. Liu, L. van der Maaten, and K. Q. Weinberger. Densely connected convolutional networks.
+In CVPR, 2017. arXiv:1608.06993.
+\bibitem{moreau2019hyper} L. Moreau and T. Ishikawa. Hyper-residual cascades for tiny image recognition.
+In Advances in Neural Information Processing Systems, 2019.
+\end{thebibliography}
+\end{document}

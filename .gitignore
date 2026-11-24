@@ -5,6 +5,7 @@ report.pdf
 report.html
 extracted_images/
 out_*_imgs/
+baseline_sources/
 
 # 临时/测试脚手架（仅忽略仓库根目录下的，testdoc/ 里的示例稿要保留）
 /_*.py

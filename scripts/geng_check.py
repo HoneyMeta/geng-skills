@@ -14,7 +14,9 @@ geng_check.py — geng-skills 论文诚信自检工具（数据取证 + 图像�
 子命令：
   data    从 .docx / .tex / 目录抽取数值表并运行取证统计 -> findings.json
           （同时重算正文报告的 t/F/r/χ2/z 检验 p 值、检查 p 值在 0.05 下方堆积、扭曲短语、
-          参考文献编号/重复；加 --verify-refs 时联网到 Crossref 核对 DOI、撤稿声明）
+          参考文献编号/重复；加 --verify-refs 时联网到 Crossref 核对 DOI、撤稿声明；
+          v1.4 起还做对比方法核查：对比表加粗/指标自洽/提升幅度，写出 baselines.json 档案，
+          加 --fetch-baselines 时联网取回被引对比方法的原文并核对数值）
   images  从 .docx / .tex / 目录抽取所有图片 + 生成清单 manifest.json（可选缩略图拼版）
   grim    GRIM 自洽检验：给定 均值/样本量/小数位（可选题目数），判断报告均值在数学上是否可能
   sprite  SPRITE-lite：给定 均值/标准差/样本量/取值上下界，判断报告标准差在数学上是否可能
@@ -53,6 +55,7 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
+import baseline_check  # noqa: E402
 import consistency_check  # noqa: E402
 import rawdata_check  # noqa: E402
 import refs_check  # noqa: E402
@@ -856,10 +859,54 @@ def run_consistency_checks(full_text, number_text, tables, source_label):
 
 
 RAW_DATA_HELPERS = {"terminal": check_terminal_digits, "benford": check_benford, "blocks": check_duplicate_blocks}
+BASELINE_HELPERS = {"tabular_re": LATEX_TABULAR_RE, "skip_args": _skip_latex_args, "strip_latex": _strip_latex,
+                    "noise_re": LATEX_NOISE_CMD_RE}
+BASELINE_TYPES = {"best_marked_not_best", "metric_inconsistent", "baseline_value_inconsistent", "improvement_claim_mismatch",
+                  "baseline_value_not_in_source", "baseline_value_differs_from_source", "baseline_name_not_in_source",
+                  "cited_baseline_not_found", "baseline_source_abstract_only", "baseline_newer_than_paper",
+                  "proposed_results_in_cited_work", "claimed_link_unreachable"}
 
 
-def analyze(input_path, verify_refs=False, mailto=None, fetch=None, data_files=None):
-    """data 子命令的完整流程：数值取证 + 正文统计量 + 一致性 + 参考文献（+ 可选原始数据文件）。"""
+def _latex_raw_body(content):
+    m = re.search(r"\\begin\{document\}", content)
+    body = content[m.end():] if m else content
+    return THEBIBLIOGRAPHY_RE.sub(" ", body)
+
+
+def _latex_link_text(body):
+    s = re.sub(r"\\href\s*\{([^}]*)\}\s*\{([^}]*)\}", r" \1 \2 ", body)
+    s = re.sub(r"\\url\s*\{([^}]*)\}", r" \1 ", s)
+    for a, b in (("\\_", "_"), ("\\#", "#"), ("\\%", "%"), ("\\&", "&"), ("\\~{}", "~")):
+        s = s.replace(a, b)
+    return s
+
+
+def load_raw_source(input_path, number_text="", refinfo=None):
+    """原始标记（LaTeX 源码 / docx 路径与外链），供对比方法核查保留加粗、\\cite、表注等信息。"""
+    if not os.path.isdir(input_path) and os.path.splitext(input_path)[1].lower() == ".docx":
+        ref_texts = {e.get("text", "") for e in (refinfo or {}).get("entries") or []}
+        links = [(u, ctx) for u, ctx in baseline_check.docx_external_links(input_path) if ctx not in ref_texts]
+        return {"kind": "docx", "path": input_path, "body": number_text, "linkText": number_text, "extraLinks": links}
+    contents = []
+    if os.path.isdir(input_path):
+        tex_files, roots = find_latex_roots(input_path)
+        seen = set()
+        for tf in (roots or tex_files):
+            if os.path.realpath(tf) in seen:
+                continue
+            content, seen = expand_latex_inputs(tf, seen)
+            contents.append(content)
+    else:
+        contents.append(expand_latex_inputs(input_path)[0])
+    body = "\n".join(_latex_raw_body(c) for c in contents)
+    return {"kind": "latex", "contents": contents, "body": body, "linkText": _latex_link_text(body)}
+
+
+def analyze(input_path, verify_refs=False, mailto=None, fetch=None, data_files=None,
+            fetch_baselines=False, baseline_fetch=None, baseline_out_dir=None, max_baseline_papers=30,
+            paper_year=None, baseline_pause=1.0):
+    """data 子命令的完整流程：数值取证 + 正文统计量 + 一致性 + 参考文献 + 对比方法核查
+    （+ 可选原始数据文件；+ 可选联网取回被引对比方法原文）。"""
     full_text, tables, label = load_source(input_path)
     refinfo = load_reference_info(input_path)
     # 参考文献里的年份、卷期、页码不是数据，不参与末位/Benford 统计
@@ -875,10 +922,25 @@ def analyze(input_path, verify_refs=False, mailto=None, fetch=None, data_files=N
         raw_findings, info = rawdata_check.run_raw_data_checks(path, RAW_DATA_HELPERS)
         extra += raw_findings
         raw_info.append(info)
+    # 对比方法核查（离线信号 + 档案；可选联网核对被引原文）
+    raw = load_raw_source(input_path, number_text, refinfo)
+    b_findings, dossier = baseline_check.analyze_baselines(raw, full_text, number_text, refinfo, label, BASELINE_HELPERS,
+                                                           paper_year=paper_year)
+    extra += b_findings
+    if fetch_baselines:
+        extra += baseline_check.fetch_baselines(dossier, label, baseline_out_dir or os.getcwd(), fetch=baseline_fetch,
+                                                mailto=mailto, max_papers=max_baseline_papers,
+                                                pause=0 if baseline_fetch else baseline_pause)
     findings = result["findings"] + extra
     for i, fd in enumerate(findings, 1):
         fd["id"] = f"data-{i:04d}"
     result["findings"] = findings
+    dossier["findingIds"] = [{"id": fd["id"], "type": fd["type"], "severity": fd["severity"], "location": fd["location"]}
+                             for fd in findings if fd["type"] in BASELINE_TYPES]
+    result["baselines"] = dossier
+    result["stats"]["comparisonTables"] = len(dossier["tables"])
+    result["stats"]["citedBaselines"] = sum(1 for t in dossier["tables"] for b in t["baselines"] if b.get("refs"))
+    result["stats"]["baselinesFetchedOnline"] = bool(fetch_baselines)
     result["severityCounts"] = dict(Counter(fd["severity"] for fd in findings))
     result["stats"]["reportedTests"] = len(stats_check.extract_reported_tests(full_text))
     result["stats"]["referenceCount"] = len(refinfo.get("entries") or [])
@@ -1215,6 +1277,73 @@ def sprite_lite(mean, sd, n, vmin, vmax, sample=False):
 SEV_ORDER = {"high": 0, "medium": 1, "low": 2, "info": 3}
 SEV_LABEL = {"high": "高", "medium": "中", "low": "低", "info": "提示"}
 
+# finding type -> 报告里显示的中文名称（type 原名仍以小字附在后面，便于对照 findings.json）
+TYPE_LABELS = {
+    "terminal_digit_uniformity": "末位数字分布异常",
+    "benford_first_digit": "首位数字偏离 Benford",
+    "arithmetic_progression": "完美等差数列",
+    "duplicate_data_block": "重复数据块",
+    "duplicate_row": "重复数据行",
+    "duplicate_column": "完全相同的两列",
+    "decimal_place_inconsistency": "小数位不一致",
+    "reported_p_inconsistent": "p 值与统计量不符",
+    "p_value_bunching": "p 值在 0.05 下方堆积",
+    "tortured_phrases": "扭曲短语",
+    "citation_without_reference": "引用找不到对应文献",
+    "reference_never_cited": "文献未被引用",
+    "duplicate_reference": "重复的参考文献",
+    "reference_doi_not_found": "DOI 不存在",
+    "reference_doi_mismatch": "DOI 与标题不符",
+    "cited_retracted_work": "引用了撤稿论文",
+    "reference_not_found": "文献在 Crossref 查不到",
+    "grim_inconsistent": "GRIM 均值不可能",
+    "grimmer_inconsistent": "GRIMMER 标准差不可能",
+    "text_table_mismatch": "正文与表格数字对调",
+    "best_marked_not_best": "加粗的值并非最优",
+    "metric_inconsistent": "指标数值自相矛盾",
+    "baseline_value_inconsistent": "同一基线跨表数值不同",
+    "improvement_claim_mismatch": "提升幅度与表格对不上",
+    "baseline_value_not_in_source": "基线数值在原文中找不到",
+    "baseline_value_differs_from_source": "基线数值与原文不同",
+    "baseline_name_not_in_source": "原文中没有该方法名",
+    "cited_baseline_not_found": "被引基线文献查无此文",
+    "baseline_source_abstract_only": "基线原文仅有摘要",
+    "baseline_newer_than_paper": "基线晚于本文",
+    "proposed_results_in_cited_work": "本文结果出现在被引文献中",
+    "claimed_link_unreachable": "代码/数据链接失效",
+}
+
+
+def type_label(t):
+    return TYPE_LABELS.get(t, t or "")
+
+
+BASELINE_VERDICT_COLUMNS = [("table", "表"), ("method", "方法"), ("ref", "引用"), ("column", "指标列"),
+                            ("reportedHere", "本文所报"), ("reportedInSource", "原文"), ("verdict", "判读"), ("comment", "说明")]
+
+
+def baseline_summary(data):
+    """一句话概括脚本的对比方法核查（表数、基线数、联网情况、各类信号数）。"""
+    dossier = data.get("baselines") or {}
+    if not dossier:
+        return ""
+    tables = dossier.get("tables") or []
+    cited = sum(1 for t in tables for b in t.get("baselines", []) if b.get("refs"))
+    total = sum(len(t.get("baselines", [])) for t in tables)
+    parts = [f"脚本识别出 {len(tables)} 张对比表、{total} 个对比方法（{cited} 个能对应到参考文献）"]
+    online = dossier.get("online") or {}
+    if online.get("enabled"):
+        parts.append(f"联网取回被引原文 {online.get('papersFetched', 0)}/{online.get('papersRequested', 0)} 篇"
+                     f"（全文 {online.get('fullText', 0)}、仅摘要 {online.get('abstractOnly', 0)}）")
+    else:
+        parts.append("未联网核对原文")
+    counts = Counter(fd.get("type") for fd in data.get("findings", []) if fd.get("type") in BASELINE_TYPES)
+    if counts:
+        parts.append("自动信号：" + "、".join(f"{type_label(k)} {v}" for k, v in sorted(counts.items(), key=lambda kv: -kv[1])))
+    else:
+        parts.append("没有自动信号")
+    return "；".join(parts) + "。"
+
 
 def load_json(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -1240,7 +1369,7 @@ def generate_html_report(data, verdicts, out_html, template_path=None):
             f"<tr class='sev-{_html_escape(fd.get('severity',''))}'>"
             f"<td>{_html_escape(fd.get('id',''))}</td>"
             f"<td>{SEV_LABEL.get(fd.get('severity'),'')}</td>"
-            f"<td>{_html_escape(fd.get('type',''))}</td>"
+            f"<td>{_html_escape(type_label(fd.get('type','')))}<br><small>{_html_escape(fd.get('type',''))}</small></td>"
             f"<td>{_html_escape(fd.get('location',''))}</td>"
             f"<td>{_html_escape(fd.get('explanation',''))}<br><small>{_html_escape(json.dumps(fd.get('stat',{}), ensure_ascii=False))}</small></td>"
             f"<td><b>{_html_escape(str(verdict))}</b><br>{_html_escape(comment)}</td>"
@@ -1256,8 +1385,20 @@ def generate_html_report(data, verdicts, out_html, template_path=None):
             f"<td>{_html_escape(iv.get('comment',''))}</td>"
             f"</tr>"
         )
+    baseline_rows = []
+    for bv in verdicts.get("baselineVerdicts", []):
+        cells = "".join(
+            f"<td>{'<b>' if k == 'verdict' else ''}{_html_escape(str(bv.get(k, '') or ''))}{'</b>' if k == 'verdict' else ''}"
+            + (f"<br><small>{SEV_LABEL.get(bv.get('severity'), '')}</small>" if k == "verdict" and bv.get("severity") else "")
+            + (f"<br><small>{_html_escape(bv.get('source', ''))}</small>" if k == "comment" and bv.get("source") else "")
+            + "</td>"
+            for k, _h in BASELINE_VERDICT_COLUMNS)
+        baseline_rows.append(f"<tr class='sev-{_html_escape(bv.get('severity', 'info'))}'>{cells}</tr>")
+    baseline_head = "".join(f"<th>{h}</th>" for _k, h in BASELINE_VERDICT_COLUMNS)
+    bsummary = baseline_summary(data)
     sev_counts = data.get("severityCounts", {})
     overall = verdicts.get("overallAssessment", "（待模型填写整体结论）")
+    n_baseline_issues = sum(1 for bv in verdicts.get("baselineVerdicts", []) if bv.get("severity") in ("high", "medium", "low"))
 
     html = f"""<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <title>geng-skills 论文诚信自检报告</title>
@@ -1280,18 +1421,23 @@ small{{color:#666}}
 <div class="meta">
 <b>文档：</b>{_html_escape(str(data.get('source','—')))}
 <b>生成时间：</b>{datetime.now().strftime('%Y-%m-%d %H:%M')}
-<b>检测类型：</b>数据完整性 + 统计量与参考文献 + 图像取证（投稿前自检）
+<b>检测类型：</b>数据完整性 + 统计量与参考文献 + 对比方法核查 + 图像取证（投稿前自检）
 </div>
 <div class="cards">
 <div class="card"><div class="n">{sev_counts.get('high',0)}</div>高风险</div>
 <div class="card"><div class="n">{sev_counts.get('medium',0)}</div>中风险</div>
 <div class="card"><div class="n">{sev_counts.get('low',0)}</div>低风险</div>
+<div class="card"><div class="n">{n_baseline_issues}</div>对比方法问题</div>
 <div class="card"><div class="n">{len(verdicts.get('imageVerdicts',[]))}</div>图像问题</div>
 </div>
 <div class="overall"><b>整体结论：</b><br>{_html_escape(str(overall))}</div>
 <h2>数据异常 + 模型判读</h2>
 <table><thead><tr><th>ID</th><th>风险</th><th>类型</th><th>位置</th><th>信号说明 / 统计</th><th>模型判读</th></tr></thead>
 <tbody>{''.join(rows) if rows else '<tr><td colspan=6>未检出数据异常信号。</td></tr>'}</tbody></table>
+<h2>对比方法核查（模型对照被引原文判读）</h2>
+<p><small>{_html_escape(bsummary) if bsummary else '本次未做对比方法核查。'}</small></p>
+<table><thead><tr>{baseline_head}</tr></thead>
+<tbody>{''.join(baseline_rows) if baseline_rows else '<tr><td colspan=8>未核对对比方法，或模型未写入 baselineVerdicts。</td></tr>'}</tbody></table>
 <h2>图像取证（模型视觉判读）</h2>
 <table><thead><tr><th>图片</th><th>风险</th><th>问题</th><th>说明</th></tr></thead>
 <tbody>{''.join(image_rows) if image_rows else '<tr><td colspan=4>未发现图像问题或未进行图像判读。</td></tr>'}</tbody></table>
@@ -1373,9 +1519,11 @@ def generate_pdf_report(data, verdicts, out_pdf):
     story.append(Spacer(1, 6))
     sev_counts = data.get("severityCounts", {})
     meta = (f"文档：{_html_escape(data.get('source','—'))}　生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}<br/>"
-            f"检测类型：数据完整性 + 统计量与参考文献 + 图像取证（投稿前自检）<br/>"
+            f"检测类型：数据完整性 + 统计量与参考文献 + 对比方法核查 + 图像取证（投稿前自检）<br/>"
             f"风险统计：高 {sev_counts.get('high',0)}　中 {sev_counts.get('medium',0)}　"
-            f"低 {sev_counts.get('low',0)}　图像问题 {len(verdicts.get('imageVerdicts',[]))}")
+            f"低 {sev_counts.get('low',0)}　对比方法问题 "
+            f"{sum(1 for bv in verdicts.get('baselineVerdicts', []) if bv.get('severity') in ('high', 'medium', 'low'))}"
+            f"　图像问题 {len(verdicts.get('imageVerdicts',[]))}")
     story.append(Paragraph(meta, base))
     story.append(Spacer(1, 8))
     overall = verdicts.get("overallAssessment", "（待模型填写整体结论）")
@@ -1393,12 +1541,13 @@ def generate_pdf_report(data, verdicts, out_pdf):
         v = vmap.get(fd.get("id"), {})
         stat = json.dumps(fd.get("stat", {}), ensure_ascii=False)
         cells = [
-            fd.get("id", ""), SEV_LABEL.get(fd.get("severity"), ""), fd.get("type", ""),
-            fd.get("location", ""),
-            fd.get("explanation", "") + "<br/><font size=6 color='#666'>" + _html_escape(stat[:300]) + "</font>",
+            _html_escape(fd.get("id", "")), SEV_LABEL.get(fd.get("severity"), ""),
+            _html_escape(type_label(fd.get("type", ""))) + "<br/><font size=6 color='#666'>" + _html_escape(fd.get("type", "")) + "</font>",
+            _html_escape(fd.get("location", "")),
+            _html_escape(fd.get("explanation", "")) + "<br/><font size=6 color='#666'>" + _html_escape(stat[:300]) + "</font>",
             "<b>" + _html_escape(str(v.get("verdict", "—"))) + "</b><br/>" + _html_escape(v.get("comment", "")),
         ]
-        table_data.append([Paragraph(_html_escape(str(c)) if i < 4 else c, base) for i, c in enumerate(cells)])
+        table_data.append([Paragraph(c, base) for c in cells])
     if len(table_data) == 1:
         table_data.append([Paragraph("未检出数据异常信号。", base)] + [Paragraph("", base)] * 5)
     t = Table(table_data, colWidths=[18 * mm, 10 * mm, 24 * mm, 30 * mm, 60 * mm, 40 * mm], repeatRows=1)
@@ -1408,6 +1557,38 @@ def generate_pdf_report(data, verdicts, out_pdf):
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
     ]))
     story.append(t)
+    story.append(Spacer(1, 10))
+
+    # 对比方法核查表
+    story.append(Paragraph("对比方法核查（模型对照被引原文判读）", h2))
+    bsummary = baseline_summary(data)
+    story.append(Paragraph(_html_escape(bsummary) if bsummary else "本次未做对比方法核查。", base))
+    story.append(Spacer(1, 4))
+    bdata = [[Paragraph(h, base) for _k, h in BASELINE_VERDICT_COLUMNS]]
+    bstyle = [
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#d0d4da")),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eef0f3")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]
+    sev_bg = {"high": "#fdecec", "medium": "#fff5e6", "low": "#fffbe6"}
+    for bv in verdicts.get("baselineVerdicts", []):
+        row = []
+        for k, _h in BASELINE_VERDICT_COLUMNS:
+            val = _html_escape(str(bv.get(k, "") or ""))
+            if k == "verdict":
+                val = "<b>" + val + "</b>" + (("<br/>风险：" + SEV_LABEL.get(bv.get("severity"), "")) if bv.get("severity") else "")
+            if k == "comment" and bv.get("source"):
+                val += "<br/><font size=6 color='#666'>" + _html_escape(bv["source"]) + "</font>"
+            row.append(Paragraph(val, base))
+        bdata.append(row)
+        if bv.get("severity") in sev_bg:
+            bstyle.append(("BACKGROUND", (0, len(bdata) - 1), (-1, len(bdata) - 1), colors.HexColor(sev_bg[bv["severity"]])))
+    if len(bdata) == 1:
+        bdata.append([Paragraph("未核对对比方法，或模型未写入 baselineVerdicts。", base)] + [Paragraph("", base)] * 7)
+        bstyle.append(("SPAN", (0, 1), (-1, 1)))
+    bt = Table(bdata, colWidths=[14 * mm, 24 * mm, 13 * mm, 22 * mm, 15 * mm, 28 * mm, 18 * mm, 48 * mm], repeatRows=1)
+    bt.setStyle(TableStyle(bstyle))
+    story.append(bt)
     story.append(Spacer(1, 10))
 
     # 图像表
@@ -1451,12 +1632,23 @@ def generate_pdf_report(data, verdicts, out_pdf):
 def cmd_data(args):
     if args.verify_refs:
         print("[data] --verify-refs：将把参考文献的 DOI / 条目文本发送到 Crossref 公共 API 核对。", file=sys.stderr)
+    if args.fetch_baselines:
+        print("[data] --fetch-baselines：将把被引对比方法的 arXiv 编号 / DOI / 标题发送到 arXiv、OpenAlex、Crossref 检索原文，"
+              f"最多 {args.max_baseline_papers} 篇，并检查文中代码/数据链接（含 GitHub API）。", file=sys.stderr)
     for path in args.data_file or []:
         if not os.path.isfile(path):
             raise SystemExit(f"找不到原始数据文件: {path}")
-    result = analyze(args.input, verify_refs=args.verify_refs, mailto=args.mailto, data_files=args.data_file)
+    out_dir = os.path.dirname(os.path.abspath(args.out))
+    result = analyze(args.input, verify_refs=args.verify_refs, mailto=args.mailto, data_files=args.data_file,
+                     fetch_baselines=args.fetch_baselines, baseline_out_dir=out_dir,
+                     max_baseline_papers=args.max_baseline_papers, paper_year=args.paper_year)
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
+    dossier = result.get("baselines") or {}
+    bpath = args.baselines_out or os.path.splitext(args.out)[0] + ".baselines.json"
+    if args.baselines_out or dossier.get("tables") or dossier.get("links") or dossier.get("datasetClaims"):
+        with open(bpath, "w", encoding="utf-8") as f:
+            json.dump(dossier, f, ensure_ascii=False, indent=2)
     print(f"[data] 已分析 {result['stats']['tableCount']} 张表 / "
           f"{result['stats']['numberCountText'] + result['stats']['numberCountTables']} 个数字，"
           f"检出 {len(result['findings'])} 条信号 -> {args.out}")
@@ -1467,6 +1659,17 @@ def cmd_data(args):
     for info in result["stats"].get("rawDataFiles", []):
         sheets = "、".join(f"{s['sheet']}（{s['rows']} 行 / {s['numericColumns']} 个数值列）" for s in info["sheets"])
         print(f"       原始数据 {info['file']}：{sheets}")
+    if dossier.get("tables") or dossier.get("links") or dossier.get("datasetClaims"):
+        online = dossier.get("online") or {}
+        line = (f"       对比方法：{result['stats']['comparisonTables']} 张对比表、{result['stats']['citedBaselines']} 个带引用的基线"
+                f" -> 档案 {bpath}")
+        if online.get("enabled"):
+            line += (f"；已联网取回 {online.get('papersFetched', 0)}/{online.get('papersRequested', 0)} 篇"
+                     f"（全文 {online.get('fullText', 0)}，仅摘要 {online.get('abstractOnly', 0)}），原文在 "
+                     f"{os.path.join(out_dir, 'baseline_sources')}")
+        else:
+            line += "（未联网核对原文，可加 --fetch-baselines）"
+        print(line)
 
 
 def cmd_images(args):
@@ -1532,9 +1735,14 @@ def main():
     p.add_argument("--out", default="findings.json")
     p.add_argument("--verify-refs", action="store_true",
                    help="联网到 Crossref 核对参考文献 DOI 是否存在、标题是否相符、是否被撤稿（需用户同意）")
-    p.add_argument("--mailto", help="可选：Crossref polite pool 的联系邮箱（由用户提供）")
+    p.add_argument("--mailto", help="可选：Crossref / OpenAlex polite pool 的联系邮箱（必须由用户提供，不要编造）")
     p.add_argument("--data-file", action="append", metavar="FILE",
                    help="论文背后的原始数据（.csv / .tsv / .xlsx），可重复；做末位数字、Benford、重复行/列/数据块检查")
+    p.add_argument("--fetch-baselines", action="store_true",
+                   help="联网到 arXiv / OpenAlex / Crossref 取回被引对比方法的原文并核对数值，检查代码/数据链接（需用户同意）")
+    p.add_argument("--max-baseline-papers", type=int, default=30, help="--fetch-baselines 最多检索的被引文献篇数，默认 30")
+    p.add_argument("--baselines-out", help="对比方法档案输出路径，默认 <out 文件名>.baselines.json")
+    p.add_argument("--paper-year", type=int, help="本文年份（用于提示晚于本文的对比方法；LaTeX 的 \\date 里有年份时自动读取）")
     p.set_defaults(func=cmd_data)
 
     p = sub.add_parser("images", help="抽取图片 + 生成清单")

@@ -17,6 +17,11 @@
 - **文本与参考文献**（v1.2 新增）：洗稿工具留下的"扭曲短语"（如 profound learning = deep learning）、正文引用编号超出参考文献列表、
   从未被引用或重复的条目；可选 `--verify-refs` 联网到 Crossref 核对 **DOI 是否存在、与标题是否相符、被引论文是否已撤稿**，
   用来发现 AI 幻觉生成的虚构引用。
+- **对比方法核查**（v1.4 新增）：对比表里**加粗却不是最优**的数、P/R/F1 自相矛盾、准确率超过 100%、同一基线在两张表数值不同、
+  正文"提升了 3.2 个百分点"在表里**算不出来**；脚本把每个对比方法、它引用的文献、数据集描述和代码链接整理成档案，
+  **AI 亲自检索被引的原文**，核对基线数值是否被压低、引用是否张冠李戴、文献是否虚构。
+  可选 `--fetch-baselines` 联网到 arXiv / OpenAlex / Crossref 自动取回原文（arXiv HTML/PDF、开放获取 PDF），
+  逐个查本文报的数在原文里有没有，并检查文中的代码/数据链接能否打开。
 - **图像 PS 痕迹**：抽取全部图片 + sha1 完全重复 + "一图多用"引用计数 + **感知哈希近重复检测**（v1.2 新增：
   把拼图切成子图，能发现缩放、重新保存、旋转、镜像后再用的子图，并生成并排对照图）+ 缩略图拼版，
   最终由 **AI 模型用视觉能力**判读复制重用、拼接、克隆/涂抹等痕迹。
@@ -58,7 +63,7 @@ pip install -r requirements.txt   # Pillow（图片）、reportlab（PDF）、Py
 
 > **使用 geng-skills 这个技能** 检查我这篇论文有没有数据/图像造假风险
 
-AI 会按技能流程自动：抽数据跑取证统计、重算正文 p 值、检查参考文献 → 抽图片、跑近重复检测并用视觉判读 PS 痕迹 → 生成 PDF 报告。
+AI 会按技能流程自动：抽数据跑取证统计、重算正文 p 值、检查参考文献 → 核对对比方法（找被引原文对数值）→ 抽图片、跑近重复检测并用视觉判读 PS 痕迹 → 生成 PDF 报告。
 
 有原始数据（Excel / CSV）的话，一起给它：
 
@@ -70,6 +75,13 @@ AI 会按技能流程自动：抽数据跑取证统计、重算正文 p 值、�
 
 联网核对会把参考文献的 DOI 和条目文字发送到 Crossref 公共 API；不说就不会联网。
 
+想让它把对比实验里引用的方法逐个拿原文核对，可以说：
+
+> **使用 geng-skills 检查这篇论文，并联网核对对比方法的原文**
+
+这会把被引对比方法的 arXiv 编号 / DOI / 标题发送到 arXiv、OpenAlex、Crossref，取回能公开获取的原文，
+并访问文中的代码/数据链接（含 GitHub API）。不联网时，AI 也会用档案里的检索链接和它自己的检索能力去核对。
+
 <details>
 <summary>手动运行底层脚本（一般无需，AI 会自动调用）</summary>
 
@@ -80,6 +92,8 @@ python scripts/geng_check.py data   --input paper.tex  --out findings.json [--ve
 python scripts/geng_check.py images --input paper.docx --out-dir extracted_images --contact-sheet
 # 1b) 同时检查原始数据（可重复）
 python scripts/geng_check.py data   --input paper.docx --out findings.json --data-file raw.xlsx
+# 1c) 对比方法核查：联网取回被引原文（档案在 findings.baselines.json，原文在 baseline_sources/）
+python scripts/geng_check.py data   --input paper.tex  --out findings.json --fetch-baselines [--max-baseline-papers 30]
 # 3) GRIM / GRIMMER / SPRITE-lite（按需）
 python scripts/geng_check.py grim   --mean 3.45 --n 20 --decimals 2          # 多题量表加 --items 5
 python scripts/geng_check.py grimmer --mean 3.00 --sd 0.85 --n 5 --decimals 2
@@ -93,11 +107,13 @@ python scripts/geng_check.py report --findings findings.json --verdicts verdicts
 
 ## 输出
 
-- `findings.json` — 数据、统计量、数字一致性、文本与参考文献、原始数据文件的信号（type / severity / location / stat / explanation）。
+- `findings.json` — 数据、统计量、数字一致性、文本与参考文献、原始数据文件、对比方法的信号（type / severity / location / stat / explanation）。
+- `findings.baselines.json` — 对比方法档案：对比表、本文方法与各基线的数值、引用与对应文献、检索链接、数据集描述、代码/数据链接；
+  加 `--fetch-baselines` 时还有原文解析结果与逐个数值的核对，原文文本在 `baseline_sources/`。
 - `extracted_images/` + `manifest.json` — 全部图片、尺寸、sha1、引用次数、完全重复分组（`exactDuplicateFiles`）、
   一图多用（`reusedImages`）、近重复子图（`nearDuplicates`，附 `_near_dup_*.png` 对照图）、缩略图拼版；
   LaTeX 的 PDF 矢量图另有 `*.preview.png`。
-- `report.pdf`（或降级 `report.html`）— 风险分级表 + 图像判读 + 整体结论 + 免责声明。
+- `report.pdf`（或降级 `report.html`）— 风险分级表 + 对比方法核查表 + 图像判读 + 整体结论 + 免责声明。
 
 ## 检查项一览
 
@@ -118,6 +134,10 @@ python scripts/geng_check.py report --findings findings.json --verdicts verdicts
 | 文本 | 扭曲短语 | 洗稿工具把术语换成字面同义词（profound learning、irregular woodland…） |
 | 参考文献 | 编号与列表 | 引用编号超出列表、条目从未被引用、重复条目、LaTeX 未定义的 `\cite` |
 | 参考文献 | 联网核对（可选） | DOI 不存在 / 与标题不符、被引论文已撤稿或有关注声明 |
+| 对比方法 | 对比表 | 加粗却不是本列最优、F1 不在 P/R 之间、有界指标超过 100%、同一基线跨表数值不同 |
+| 对比方法 | 提升幅度 | 正文"提升 3.2 个百分点 / improves by 3.2%"与表中任何一对数（绝对差、相对变化）都对不上 |
+| 对比方法 | 联网核对原文（可选） | 基线数值在原文找不到或与原文不同（报得更差为高风险）、原文没有该方法名、被引文献查无此文、本文结果出现在被引文献里、代码/数据链接失效 |
+| 对比方法 | AI 核查 | 原文同设置下的数值、设置是否可比、遗漏更强的公认结果、不公平比较、数据集统计与原始数据集不符 |
 | 图像 | 完全重复文件 | sha1 一致（脚本自动） |
 | 图像 | 一图多用 | 同一图片文件在文中插入多次（脚本自动，docx 靠引用计数） |
 | 图像 | 近重复子图 | 感知哈希，覆盖缩放、重存、裁进拼图、旋转、镜像（脚本自动，需看图确认） |
@@ -131,6 +151,8 @@ python scripts/geng_check.py report --findings findings.json --verdicts verdicts
 - 正文 GRIM/GRIMMER 只检查同一句写明 n、且上下文说明是整数数据的报告；正文与表格只比对相邻数字对调这类笔误。
 - p 值重算只覆盖正文写全统计量和自由度的检验；只写 `p < 0.05` 的结果无法检查。
 - 联网核对只覆盖 Crossref 收录的文献；多数中文期刊、书籍、学位论文、网页查不到属正常，查不到≠不存在。
+- 对比方法核查只覆盖能对应到参考文献的基线；付费墙论文、扫描版 PDF、只画在图里的结果脚本核对不了，要靠 AI 检索或作者核对；
+  PDF 抽出的文本会丢表格结构，"与原文不同"必须看原文确认。
 - 所有结论需人工/模型确认；本工具只提供线索与报告，**不构成造假认定**，也不对应任何官方检测系统。
 
 ## English
@@ -164,6 +186,20 @@ What it checks:
   terminal-digit tests (only when their range is wide enough), the sheet gets Benford, and identical rows with
   decimals, identical columns and repeated runs in continuous columns are reported. ID columns are skipped, and
   rows of Likert answers that happen to match are not flagged.
+- **Comparison methods / baselines** (new in v1.4): comparison tables are re-read with their markup. Bold values
+  that are not the best of their column, F1 outside [min(P, R), max(P, R)] or far from 2PR/(P+R), bounded metrics
+  above 100 %, the same cited baseline with different values in two tables, and improvement claims ("improves …
+  by 3.2 %", "提升了 3.2 个百分点") that no pair of table rows reproduces are flagged. A baseline dossier
+  (`findings.baselines.json`) lists every baseline with its values, its citation resolved to the reference entry,
+  retrieval links, the dataset statistics claimed in the text, and code/data links; **the AI then retrieves the cited
+  papers itself** and checks each number against the original (same dataset, split, metric and setting).
+  With `--fetch-baselines` (only after the user agrees) the cited papers are looked up on arXiv, OpenAlex and
+  Crossref, open full text is cached in `baseline_sources/`, and the script reports values not found in or
+  different from the source (high when the paper reports the baseline worse than its source), method names
+  missing from the cited work, cited baselines that cannot be found anywhere (possibly fabricated), the
+  proposed method's own numbers appearing in a cited paper, and dead code/data links. Disclosed re-runs (†,
+  table notes, "we re-implemented …") are downgraded to info. The report gets a "对比方法核查" table from the
+  model's `baselineVerdicts`.
 - **Images**: every figure is extracted; byte-identical files, the same image inserted twice, and (new in v1.2)
   perceptual-hash near-duplicates: figures are split into panels and photo-like panels are compared under
   8 rotations/mirrorings, so resized, re-saved, cropped, rotated or mirrored reuse is found. Side-by-side preview
@@ -174,11 +210,16 @@ Install by telling your AI assistant:
 > **Install the skill at https://github.com/HoneyMeta/geng-skills**
 
 Then: **"Use geng-skills to check my paper for data and image integrity problems"** (add "and verify the
-references online" to allow Crossref lookups, or "the raw data is in data/raw.xlsx" to check the data file too). Optional dependencies: `pip install -r requirements.txt`.
+references online" to allow Crossref lookups, "and check the compared methods against their original papers
+online" to allow `--fetch-baselines`, or "the raw data is in data/raw.xlsx" to check the data file too).
+Optional dependencies: `pip install -r requirements.txt`.
 
 Limits: image comparison is within the paper only (no cross-paper database such as ImageTwin or Proofig);
 p-value recomputation needs the full statistic and degrees of freedom in the text; online verification only
-covers works registered with Crossref, so "not found" means "check by hand", not "does not exist".
+covers works registered with Crossref, so "not found" means "check by hand", not "does not exist". Baseline
+verification only covers baselines that cite a reference; paywalled papers, scanned PDFs and numbers shown only
+in figures cannot be checked by the script, and text extracted from PDFs loses table structure, so a "differs
+from source" signal always needs a look at the original.
 
 ## License
 

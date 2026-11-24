@@ -227,7 +227,8 @@ def parse_latex_references(content, base_dir):
     for m in BIBITEM_RE.finditer(content):
         text = re.sub(r"\s+", " ", re.sub(r"\\[a-zA-Z]+\s*|[{}]", " ", m.group(2))).strip()
         doi = DOI_RE.search(m.group(2))
-        entries.append({"key": m.group(1).strip(), "text": text, "doi": doi.group(1).rstrip(".") if doi else "", "title": "", "source": "bibitem"})
+        entries.append({"key": m.group(1).strip(), "text": text.replace("\\_", "_"),
+                        "doi": doi.group(1).replace("\\_", "_").rstrip(".") if doi else "", "title": "", "source": "bibitem"})
     for m in BIB_FILES_RE.finditer(content):
         for name in m.group(1).split(","):
             name = name.strip()
@@ -242,7 +243,8 @@ def parse_latex_references(content, base_dir):
                 body = e.group(3)
                 title = _bib_field(body, "title")
                 parts = [_bib_field(body, "author"), title, _bib_field(body, "journal") or _bib_field(body, "booktitle"), _bib_field(body, "year")]
-                entries.append({"key": e.group(2).strip(), "text": ". ".join(p for p in parts if p), "doi": _bib_field(body, "doi"), "title": title, "source": "bib"})
+                entries.append({"key": e.group(2).strip(), "text": ". ".join(p for p in parts if p), "doi": _bib_field(body, "doi"), "title": title, "source": "bib",
+                                "eprint": _bib_field(body, "eprint"), "url": _bib_field(body, "url")})
     return cited, entries
 
 
@@ -277,7 +279,7 @@ def check_latex_citations(cited, entries, source_label):
 # Crossref verification (opt-in, network)
 # ---------------------------------------------------------------------------
 
-USER_AGENT = "geng-skills/1.2 (+https://github.com/HoneyMeta/geng-skills)"
+USER_AGENT = "geng-skills/1.4 (+https://github.com/HoneyMeta/geng-skills)"
 
 
 def crossref_get(url, mailto=None, timeout=20):
